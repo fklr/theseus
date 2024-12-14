@@ -80,11 +80,13 @@ impl SigningKeyPair {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationProof {
     pub entry_id: EntryId,
     pub proof_data: Vec<u8>,
     pub generation: u32,
     pub transcript_bytes: Vec<u8>,
+    pub commitment: [u8; 32],
 }
 
 impl ValidationProof {
@@ -93,18 +95,21 @@ impl ValidationProof {
         proof_data: Vec<u8>,
         generation: u32,
         transcript_bytes: Vec<u8>,
+        commitment: [u8; 32],
     ) -> Self {
         Self {
             entry_id,
             proof_data,
             generation,
             transcript_bytes,
+            commitment,
         }
     }
 
     pub fn create_transcript(&self) -> merlin::Transcript {
         let mut transcript = merlin::Transcript::new(b"theseus-entry-validation");
         transcript.append_message(b"transcript-data", &self.transcript_bytes);
+        transcript.append_message(b"transcript-data", &self.commitment);
         transcript
     }
 }

@@ -3,12 +3,21 @@ use curve25519_dalek::{ristretto::CompressedRistretto, scalar::Scalar};
 use ed25519_dalek::Verifier;
 use merlin::Transcript;
 use rand::thread_rng;
+use serde::Serialize;
 
 use crate::errors::{Error, Result};
 use crate::types::{
     ACLEntry, AdminKeySet, SerializableSignature, SigningKeyPair, SuccessionRecord,
     SuccessionRequest, ValidationProof,
 };
+
+#[derive(Serialize)]
+struct UnsignedEntry<'a> {
+    id: &'a crate::types::EntryId,
+    service_id: &'a crate::types::ServiceId,
+    policy_generation: u32,
+    metadata: &'a crate::types::EntryMetadata,
+}
 
 pub struct ProofSystem {
     bp_gens: BulletproofGens,
@@ -143,7 +152,7 @@ impl ProofSystem {
             old_keys: current_admin.active_keys,
             new_keys: request.new_verifying_keys,
             generation: current_admin.policy_generation + 1,
-            timestamp: time::OffsetDateTime::now_utc(),
+            timestamp: current_admin.last_rotation,
             affected_entries: request.affected_entries.clone(),
             signatures,
             request_metadata: None,
@@ -160,6 +169,10 @@ impl ProofSystem {
         }
 
         if record.generation != current_admin.policy_generation + 1 {
+            return Ok(false);
+        }
+
+        if record.timestamp != current_admin.last_rotation {
             return Ok(false);
         }
 
@@ -185,11 +198,15 @@ impl ProofSystem {
         Ok(key_pair.sign(&message))
     }
 
-    fn create_entry_message(&self, entry: &ACLEntry) -> Vec<u8> {
-        let mut message = Vec::with_capacity(36);
-        message.extend_from_slice(&entry.id.0);
-        message.extend_from_slice(&entry.policy_generation.to_le_bytes());
-        message
+    pub fn create_entry_message(&self, entry: &ACLEntry) -> Vec<u8> {
+        let unsigned = UnsignedEntry {
+            id: &entry.id,
+            service_id: &entry.service_id,
+            policy_generation: entry.policy_generation,
+            metadata: &entry.metadata,
+        };
+
+        serde_json::to_vec(&unsigned).expect("Entry serialization should never fail")
     }
 
     fn create_succession_message(
@@ -211,6 +228,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signature, SigningKey};
     use rand::{rngs::OsRng, RngCore};
+    use time::OffsetDateTime;
 
     fn generate_test_keys() -> (SigningKeyPair, SigningKeyPair) {
         let mut rng = OsRng;
@@ -224,11 +242,11 @@ mod tests {
         (key1, key2)
     }
 
-    fn create_test_admin_set(keys: &[SigningKeyPair; 2]) -> AdminKeySet {
+    fn create_test_admin_set(keys: &[SigningKeyPair; 2], timestamp: OffsetDateTime) -> AdminKeySet {
         AdminKeySet {
             active_keys: [keys[0].verifying_key, keys[1].verifying_key],
             policy_generation: 1,
-            last_rotation: time::OffsetDateTime::now_utc(),
+            last_rotation: timestamp,
         }
     }
 
@@ -237,26 +255,26 @@ mod tests {
         let proof_system = ProofSystem::new();
         let (key1, key2) = generate_test_keys();
         let admin_keys = [key1, key2];
-        let admin_set = create_test_admin_set(&admin_keys);
 
-        let entry = ACLEntry {
+        let fixed_time = OffsetDateTime::from_unix_timestamp(1640995200).unwrap();
+        let admin_set = create_test_admin_set(&admin_keys, fixed_time);
+
+        let metadata = crate::types::EntryMetadata {
+            created_at: fixed_time,
+            expires_at: None,
+            version: 1,
+            service_specific: serde_json::Value::Null,
+        };
+
+        let mut entry = ACLEntry {
             id: crate::types::EntryId::new([0; 32]),
             service_id: crate::types::ServiceId("test".into()),
             policy_generation: 1,
-            metadata: crate::types::EntryMetadata {
-                created_at: time::OffsetDateTime::now_utc(),
-                expires_at: None,
-                version: 1,
-                service_specific: serde_json::Value::Null,
-            },
+            metadata,
             signature: SerializableSignature(Signature::from_bytes(&[0; 64])),
         };
 
-        // Properly sign the entry
-        let entry = ACLEntry {
-            signature: proof_system.sign_entry(&entry, &admin_keys[0]).unwrap(),
-            ..entry
-        };
+        entry.signature = proof_system.sign_entry(&entry, &admin_keys[0]).unwrap();
 
         let proof = proof_system
             .generate_validation_proof(&entry, &admin_set, None)
@@ -264,6 +282,13 @@ mod tests {
 
         assert!(proof_system
             .verify_validation_proof(&proof, &entry, &admin_set)
+            .unwrap());
+
+        let mut tampered_entry = entry.clone();
+        tampered_entry.metadata.created_at += time::Duration::hours(1);
+        tampered_entry.signature = proof_system.sign_entry(&entry, &admin_keys[0]).unwrap();
+        assert!(!proof_system
+            .verify_validation_proof(&proof, &tampered_entry, &admin_set)
             .unwrap());
     }
 
@@ -273,7 +298,9 @@ mod tests {
         let (old_key1, old_key2) = generate_test_keys();
         let (new_key1, new_key2) = generate_test_keys();
         let old_keys = [old_key1, old_key2];
-        let admin_set = create_test_admin_set(&old_keys);
+
+        let fixed_time = OffsetDateTime::from_unix_timestamp(1640995200).unwrap();
+        let admin_set = create_test_admin_set(&old_keys, fixed_time);
 
         let request = SuccessionRequest {
             current_keys: old_keys,
@@ -284,6 +311,15 @@ mod tests {
         let record = proof_system
             .process_succession(&request, &admin_set)
             .unwrap();
+
         assert!(proof_system.verify_succession(&record, &admin_set).unwrap());
+
+        assert_eq!(record.timestamp, fixed_time);
+
+        let mut tampered_record = record.clone();
+        tampered_record.timestamp = fixed_time + time::Duration::hours(1);
+        assert!(!proof_system
+            .verify_succession(&tampered_record, &admin_set)
+            .unwrap());
     }
 }

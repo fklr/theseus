@@ -155,26 +155,28 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::{rngs::OsRng, RngCore};
     use tempfile::tempdir;
+    use time::OffsetDateTime;
 
     async fn setup_test_validator() -> (ServiceValidator, SigningKeyPair, ACLEntry) {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let storage = Arc::new(Storage::new(db_path).unwrap());
 
-        // Generate test keys
         let mut rng = OsRng;
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         let key_pair = SigningKeyPair::new(SigningKey::from_bytes(&seed));
 
         let service_id = ServiceId("test".into());
+
+        let fixed_time = OffsetDateTime::from_unix_timestamp(1640995200).unwrap();
+
         let admin = AdminKeySet {
             active_keys: [key_pair.verifying_key; 2],
             policy_generation: 1,
-            last_rotation: time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+            last_rotation: fixed_time,
         };
 
-        // Initialize admin state
         storage.set_admin_state(&admin).unwrap();
 
         let service_def = ServiceDefinition {
@@ -197,38 +199,27 @@ mod tests {
             min_policy_age: time::Duration::hours(1),
         };
 
-        let creation_time = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
-        let entry = ACLEntry {
+        let metadata = EntryMetadata {
+            created_at: fixed_time - time::Duration::hours(2),
+            expires_at: None,
+            version: 1,
+            service_specific: serde_json::Value::Null,
+        };
+
+        let mut entry = ACLEntry {
             id: EntryId::new([1; 32]),
             service_id: service_id.clone(),
             policy_generation: 1,
-            metadata: EntryMetadata {
-                created_at: creation_time,
-                expires_at: None,
-                version: 1,
-                service_specific: serde_json::Value::Null,
-            },
-            signature: storage
-                .proof_system()
-                .sign_entry(
-                    &ACLEntry {
-                        id: EntryId::new([1; 32]),
-                        service_id,
-                        policy_generation: 1,
-                        metadata: EntryMetadata {
-                            created_at: time::OffsetDateTime::now_utc(),
-                            expires_at: None,
-                            version: 1,
-                            service_specific: serde_json::Value::Null,
-                        },
-                        signature: crate::types::SerializableSignature(
-                            ed25519_dalek::Signature::from_bytes(&[0; 64]),
-                        ),
-                    },
-                    &key_pair,
-                )
-                .unwrap(),
+            metadata,
+            signature: crate::types::SerializableSignature(ed25519_dalek::Signature::from_bytes(
+                &[0; 64],
+            )),
         };
+
+        entry.signature = storage
+            .proof_system()
+            .sign_entry(&entry, &key_pair)
+            .unwrap();
 
         storage.add_entry(&entry, &admin).unwrap();
 

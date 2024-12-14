@@ -101,7 +101,8 @@ impl ProofSystem {
         let range_proof = RangeProof::from_bytes(&proof.proof_data)
             .map_err(|e| Error::invalid_proof(e.to_string()))?;
 
-        let compressed_point = CompressedRistretto::from_slice(&proof.commitment).unwrap();
+        let compressed_point = CompressedRistretto::from_slice(&proof.commitment)
+            .map_err(|e| Error::crypto_error(e.to_string()))?;
 
         range_proof
             .verify_single(

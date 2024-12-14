@@ -200,6 +200,59 @@ impl Storage {
         serde_json::from_slice(admin_bytes.value())
             .map_err(|e| Error::crypto_error(format!("Failed to deserialize admin state: {}", e)))
     }
+
+    pub fn proof_system(&self) -> &ProofSystem {
+        &self.proof_system
+    }
+
+    pub fn get_entry(&self, entry_id: &[u8]) -> Result<Option<ACLEntry>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::crypto_error(format!("Failed to begin transaction: {}", e)))?;
+        let entries_table = read_txn
+            .open_table(ENTRIES)
+            .map_err(|e| Error::crypto_error(format!("Failed to open entries table: {}", e)))?;
+
+        if let Some(entry_bytes) = entries_table
+            .get(entry_id)
+            .map_err(|e| Error::crypto_error(format!("Failed to read entry: {}", e)))?
+        {
+            let entry = serde_json::from_slice(entry_bytes.value())
+                .map_err(|e| Error::crypto_error(format!("Failed to deserialize entry: {}", e)))?;
+            Ok(Some(entry))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_admin_state(&self, admin: &AdminKeySet) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::crypto_error(format!("Failed to begin transaction: {}", e)))?;
+        {
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).map_err(|e| {
+                Error::crypto_error(format!("Failed to open admin state table: {}", e))
+            })?;
+
+            let admin_bytes = serde_json::to_vec(admin).map_err(|e| {
+                Error::crypto_error(format!("Failed to serialize admin state: {}", e))
+            })?;
+
+            admin_table
+                .insert(
+                    b"current".as_slice() as &[u8],
+                    admin_bytes.as_ref() as &[u8],
+                )
+                .map_err(|e| Error::crypto_error(format!("Failed to insert admin state: {}", e)))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| Error::crypto_error(format!("Failed to commit transaction: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,19 +1,21 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock as AsyncRwLock;
+use dashmap::DashMap;
+use tokio::sync::{oneshot, watch};
 
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::storage::Storage;
 use crate::types::{AdminKeySet, EntryId, ServiceDefinition, ServiceId};
 
 pub struct ServiceValidator {
     storage: Arc<Storage>,
     service_def: ServiceDefinition,
-    cache: RwLock<HashMap<EntryId, CacheEntry>>,
-    admin_state: AsyncRwLock<AdminKeySet>,
+    cache: DashMap<EntryId, CacheEntry>,
+    admin_state_tx: watch::Sender<AdminKeySet>,
+    admin_state: watch::Receiver<AdminKeySet>,
     sync_interval: Duration,
+    _shutdown: oneshot::Sender<()>,
 }
 
 struct CacheEntry {
@@ -29,12 +31,33 @@ impl ServiceValidator {
         sync_interval: Duration,
     ) -> Result<Self> {
         let admin_state = storage.get_current_admin()?;
+        let (tx, rx) = watch::channel(admin_state);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        let tx_clone = tx.clone();
+        let storage_clone = Arc::clone(&storage);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(sync_interval) => {
+                        if let Ok(new_admin) = storage_clone.get_current_admin() {
+                            if tx_clone.send(new_admin).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut shutdown_rx => break
+                }
+            }
+        });
         Ok(Self {
             storage,
             service_def,
-            cache: RwLock::new(HashMap::new()),
-            admin_state: AsyncRwLock::new(admin_state),
+            cache: DashMap::new(),
+            admin_state_tx: tx,
+            admin_state: rx,
             sync_interval,
+            _shutdown: shutdown_tx,
         })
     }
 
@@ -43,48 +66,29 @@ impl ServiceValidator {
     }
 
     pub async fn validate_access(&self, entry_id: &EntryId) -> Result<bool> {
-        // First check cache
         if let Some(cached) = self.check_cache(entry_id)? {
             return Ok(cached);
         }
 
-        // Get current admin state for validation
-        let admin = self.admin_state.read().await;
-
-        let valid = self.storage.validate_entry(&entry_id.0, &admin)?;
-
-        // If valid, verify service ID matches
-        if valid {
-            if let Some(entry) = self.storage.get_entry(&entry_id.0)? {
-                if entry.service_id != self.service_def.id {
-                    return Ok(false);
-                }
-            } else {
-                return Ok(false);
+        let admin = self.admin_state.borrow().clone();
+        let result = match self.storage.get_entry(&entry_id.0)? {
+            Some(entry) if entry.service_id == self.service_def.id => {
+                self.storage.validate_entry(&entry_id.0, &admin)?
             }
-        }
+            _ => false,
+        };
 
-        // Update cache with validation result
-        self.update_cache(entry_id, valid, admin.policy_generation)?;
-
-        Ok(valid)
+        self.update_cache(entry_id, result, admin.policy_generation)?;
+        Ok(result)
     }
 
     pub async fn sync_admin_state(&self) -> Result<()> {
         let new_admin = self.storage.get_current_admin()?;
-        let mut admin = self.admin_state.write().await;
-
-        // If admin state has changed, invalidate cache entries from old generations
-        if new_admin.policy_generation > admin.policy_generation {
-            let mut cache = self
-                .cache
-                .write()
-                .map_err(|_| Error::crypto_error("Failed to acquire cache lock"))?;
-
-            cache.retain(|_, entry| entry.policy_generation >= new_admin.policy_generation);
+        if new_admin.policy_generation > self.admin_state.borrow().policy_generation {
+            self.cache
+                .retain(|_, entry| entry.policy_generation >= new_admin.policy_generation);
+            let _ = self.admin_state_tx.send(new_admin);
         }
-
-        *admin = new_admin;
         Ok(())
     }
 
@@ -120,29 +124,19 @@ impl ServiceValidator {
     }
 
     fn check_cache(&self, entry_id: &EntryId) -> Result<Option<bool>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| Error::crypto_error("Failed to acquire cache lock"))?;
-
-        if let Some(entry) = cache.get(entry_id) {
-            // Check if cache entry is still valid based on time and policy generation
+        if let Some(entry) = self.cache.get(entry_id) {
             let now = time::OffsetDateTime::now_utc();
-            if (now - entry.timestamp) < self.sync_interval {
+            let interval = time::Duration::seconds(self.sync_interval.as_secs() as i64);
+
+            if (now - entry.timestamp) < interval {
                 return Ok(Some(entry.valid));
             }
         }
-
         Ok(None)
     }
 
     fn update_cache(&self, entry_id: &EntryId, valid: bool, generation: u32) -> Result<()> {
-        let mut cache = self
-            .cache
-            .write()
-            .map_err(|_| Error::crypto_error("Failed to acquire cache lock"))?;
-
-        cache.insert(
+        self.cache.insert(
             *entry_id,
             CacheEntry {
                 valid,
@@ -150,7 +144,6 @@ impl ServiceValidator {
                 timestamp: time::OffsetDateTime::now_utc(),
             },
         );
-
         Ok(())
     }
 }
@@ -270,7 +263,7 @@ mod tests {
         validator.sync_admin_state().await.unwrap();
 
         // Admin state should match storage
-        let admin = validator.admin_state.read().await;
+        let admin = validator.admin_state.borrow().clone();
         let storage_admin = validator.storage.get_current_admin().unwrap();
         assert_eq!(admin.policy_generation, storage_admin.policy_generation);
     }

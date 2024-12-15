@@ -4,12 +4,21 @@ use ed25519_dalek::Verifier;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use time::OffsetDateTime;
+use tokio::time::timeout;
 
 use crate::crypto::ProofSystem;
 use crate::errors::{Error, Result};
 use crate::types::{ACLEntry, AdminKeySet, SuccessionRecord, ValidationProof};
+
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RATE_WINDOW: Duration = Duration::from_secs(300);
+const MAX_OPERATIONS: u64 = 100;
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const PROOFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("proofs");
@@ -31,6 +40,8 @@ pub struct Storage {
     db: Database,
     proof_system: ProofSystem,
     last_audit_hash: Option<Hash>,
+    operation_counter: AtomicU64,
+    last_reset: AtomicU64,
 }
 
 impl Storage {
@@ -237,289 +248,359 @@ impl Storage {
             db,
             proof_system: ProofSystem::new(),
             last_audit_hash: None,
+            operation_counter: AtomicU64::new(0),
+            last_reset: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
         })
     }
 
-    pub fn add_entry(&mut self, entry: &ACLEntry, admin: &AdminKeySet) -> Result<()> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            Error::database_error(
-                "Database transaction failed",
-                format!("Failed to begin transaction: {}", e),
-            )
-        })?;
+    fn check_rate_limit(&self) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        let message = self.proof_system.create_entry_message(entry);
-        let valid_signature = admin
-            .active_keys
-            .iter()
-            .any(|key| key.verify(&message, &entry.signature.0).is_ok());
+        let last_reset = self.last_reset.load(Ordering::Acquire);
+        if now - last_reset > RATE_WINDOW.as_secs()
+            && self
+                .last_reset
+                .compare_exchange(last_reset, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.operation_counter.store(0, Ordering::Release);
+        }
 
-        if !valid_signature {
-            let audit_details = json!({
-                "error": "invalid_signature",
-                "service_id": entry.service_id.0,
-                "policy_generation": entry.policy_generation,
-            });
-            self.write_audit_log(
-                &write_txn,
-                "entry_validation_failed".into(),
-                admin.policy_generation,
-                audit_details,
-            )?;
-
-            return Err(Error::invalid_entry(
-                "Access validation failed",
-                "Invalid entry signature",
+        let operation_count = self.operation_counter.fetch_add(1, Ordering::AcqRel);
+        if operation_count >= MAX_OPERATIONS {
+            return Err(Error::database_error(
+                "Rate limit exceeded",
+                "Too many operations in time window",
             ));
         }
 
-        let proof = self
-            .proof_system
-            .generate_validation_proof(entry, admin, None)?;
+        Ok(())
+    }
 
-        let entry_bytes = serde_json::to_vec(&entry).map_err(|e| {
-            Error::database_error(
-                "Serialization failed",
-                format!("Failed to serialize entry: {}", e),
-            )
-        })?;
-        let proof_bytes = serde_json::to_vec(&proof).map_err(|e| {
-            Error::database_error(
-                "Serialization failed",
-                format!("Failed to serialize proof: {}", e),
-            )
-        })?;
+    pub async fn add_entry(&mut self, entry: &ACLEntry, admin: &AdminKeySet) -> Result<()> {
+        self.check_rate_limit()?;
 
-        {
-            let mut entries_table = write_txn.open_table(ENTRIES).map_err(|e| {
+        timeout(OPERATION_TIMEOUT, async {
+            let write_txn = self.db.begin_write().map_err(|e| {
+                Error::database_error(
+                    "Database transaction failed",
+                    format!("Failed to begin transaction: {}", e),
+                )
+            })?;
+
+            let message = self.proof_system.create_entry_message(entry);
+            let valid_signature = admin
+                .active_keys
+                .iter()
+                .any(|key| key.verify(&message, &entry.signature.0).is_ok());
+
+            if !valid_signature {
+                let audit_details = json!({
+                    "error": "invalid_signature",
+                    "service_id": entry.service_id.0,
+                    "policy_generation": entry.policy_generation,
+                });
+                self.write_audit_log(
+                    &write_txn,
+                    "entry_validation_failed".into(),
+                    admin.policy_generation,
+                    audit_details,
+                )?;
+
+                return Err(Error::invalid_entry(
+                    "Access validation failed",
+                    "Invalid entry signature",
+                ));
+            }
+
+            let proof = self
+                .proof_system
+                .generate_validation_proof(entry, admin, None)?;
+
+            let entry_bytes = serde_json::to_vec(&entry).map_err(|e| {
+                Error::database_error(
+                    "Serialization failed",
+                    format!("Failed to serialize entry: {}", e),
+                )
+            })?;
+            let proof_bytes = serde_json::to_vec(&proof).map_err(|e| {
+                Error::database_error(
+                    "Serialization failed",
+                    format!("Failed to serialize proof: {}", e),
+                )
+            })?;
+
+            {
+                let mut entries_table = write_txn.open_table(ENTRIES).map_err(|e| {
+                    Error::database_error(
+                        "Database access failed",
+                        format!("Failed to open entries table: {}", e),
+                    )
+                })?;
+                let mut proofs_table = write_txn.open_table(PROOFS).map_err(|e| {
+                    Error::database_error(
+                        "Database access failed",
+                        format!("Failed to open proofs table: {}", e),
+                    )
+                })?;
+
+                entries_table
+                    .insert(entry.id.0.as_ref() as &[u8], entry_bytes.as_ref() as &[u8])
+                    .map_err(|e| {
+                        Error::database_error(
+                            "Database write failed",
+                            format!("Failed to insert entry: {}", e),
+                        )
+                    })?;
+                proofs_table
+                    .insert(entry.id.0.as_ref() as &[u8], proof_bytes.as_ref() as &[u8])
+                    .map_err(|e| {
+                        Error::database_error(
+                            "Database write failed",
+                            format!("Failed to insert proof: {}", e),
+                        )
+                    })?;
+            }
+
+            let audit_details = json!({
+                "entry_id": B64.encode(entry.id.0),
+                "service_id": entry.service_id.0,
+                "policy_generation": entry.policy_generation,
+            });
+            let hash = self.write_audit_log(
+                &write_txn,
+                "entry_added".into(),
+                admin.policy_generation,
+                audit_details,
+            )?;
+            self.update_last_audit_hash(hash);
+
+            write_txn.commit().map_err(|e| {
+                Error::database_error(
+                    "Database transaction failed",
+                    format!("Failed to commit transaction: {}", e),
+                )
+            })?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            Error::database_error(
+                "Operation timeout",
+                "Add entry operation exceeded timeout limit",
+            )
+        })??;
+
+        Ok(())
+    }
+
+    pub async fn validate_entry(&self, entry_id: &[u8], admin: &AdminKeySet) -> Result<bool> {
+        self.check_rate_limit()?;
+
+        timeout(OPERATION_TIMEOUT, async {
+            let read_txn = self.db.begin_read().map_err(|e| {
+                Error::database_error(
+                    "Database transaction failed",
+                    format!("Failed to begin transaction: {}", e),
+                )
+            })?;
+
+            let entries_table = read_txn.open_table(ENTRIES).map_err(|e| {
                 Error::database_error(
                     "Database access failed",
                     format!("Failed to open entries table: {}", e),
                 )
             })?;
-            let mut proofs_table = write_txn.open_table(PROOFS).map_err(|e| {
+            let proofs_table = read_txn.open_table(PROOFS).map_err(|e| {
                 Error::database_error(
                     "Database access failed",
                     format!("Failed to open proofs table: {}", e),
                 )
             })?;
 
-            entries_table
-                .insert(entry.id.0.as_ref() as &[u8], entry_bytes.as_ref() as &[u8])
-                .map_err(|e| {
+            let entry_bytes = match entries_table.get(entry_id).map_err(|e| {
+                Error::database_error(
+                    "Database read failed",
+                    format!("Failed to read entry: {}", e),
+                )
+            })? {
+                Some(bytes) => bytes,
+                None => return Ok(false),
+            };
+
+            let proof_bytes = match proofs_table.get(entry_id).map_err(|e| {
+                Error::database_error(
+                    "Database read failed",
+                    format!("Failed to read proof: {}", e),
+                )
+            })? {
+                Some(bytes) => bytes,
+                None => return Ok(false),
+            };
+
+            let entry: ACLEntry = serde_json::from_slice(entry_bytes.value()).map_err(|e| {
+                Error::database_error(
+                    "Deserialization failed",
+                    format!("Failed to deserialize entry: {}", e),
+                )
+            })?;
+
+            let proof: ValidationProof =
+                serde_json::from_slice(proof_bytes.value()).map_err(|e| {
                     Error::database_error(
-                        "Database write failed",
-                        format!("Failed to insert entry: {}", e),
+                        "Deserialization failed",
+                        format!("Failed to deserialize proof: {}", e),
                     )
                 })?;
-            proofs_table
-                .insert(entry.id.0.as_ref() as &[u8], proof_bytes.as_ref() as &[u8])
-                .map_err(|e| {
-                    Error::database_error(
-                        "Database write failed",
-                        format!("Failed to insert proof: {}", e),
-                    )
-                })?;
-        }
 
-        let audit_details = json!({
-            "entry_id": B64.encode(entry.id.0),
-            "service_id": entry.service_id.0,
-            "policy_generation": entry.policy_generation,
-        });
-        let hash = self.write_audit_log(
-            &write_txn,
-            "entry_added".into(),
-            admin.policy_generation,
-            audit_details,
-        )?;
-        self.update_last_audit_hash(hash);
-
-        write_txn.commit().map_err(|e| {
+            self.proof_system
+                .verify_validation_proof(&proof, &entry, admin)
+        })
+        .await
+        .map_err(|_| {
             Error::database_error(
-                "Database transaction failed",
-                format!("Failed to commit transaction: {}", e),
+                "Operation timeout",
+                "Validation operation exceeded timeout limit",
             )
-        })?;
-
-        Ok(())
+        })?
     }
 
-    pub fn validate_entry(&self, entry_id: &[u8], admin: &AdminKeySet) -> Result<bool> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            Error::database_error(
-                "Database transaction failed",
-                format!("Failed to begin transaction: {}", e),
-            )
-        })?;
-
-        let entries_table = read_txn.open_table(ENTRIES).map_err(|e| {
-            Error::database_error(
-                "Database access failed",
-                format!("Failed to open entries table: {}", e),
-            )
-        })?;
-        let proofs_table = read_txn.open_table(PROOFS).map_err(|e| {
-            Error::database_error(
-                "Database access failed",
-                format!("Failed to open proofs table: {}", e),
-            )
-        })?;
-
-        let entry_bytes = match entries_table.get(entry_id).map_err(|e| {
-            Error::database_error(
-                "Database read failed",
-                format!("Failed to read entry: {}", e),
-            )
-        })? {
-            Some(bytes) => bytes,
-            None => return Ok(false),
-        };
-
-        let proof_bytes = match proofs_table.get(entry_id).map_err(|e| {
-            Error::database_error(
-                "Database read failed",
-                format!("Failed to read proof: {}", e),
-            )
-        })? {
-            Some(bytes) => bytes,
-            None => return Ok(false),
-        };
-
-        let entry: ACLEntry = serde_json::from_slice(entry_bytes.value()).map_err(|e| {
-            Error::database_error(
-                "Deserialization failed",
-                format!("Failed to deserialize entry: {}", e),
-            )
-        })?;
-
-        let proof: ValidationProof = serde_json::from_slice(proof_bytes.value()).map_err(|e| {
-            Error::database_error(
-                "Deserialization failed",
-                format!("Failed to deserialize proof: {}", e),
-            )
-        })?;
-
-        self.proof_system
-            .verify_validation_proof(&proof, &entry, admin)
-    }
-
-    pub fn process_succession(
+    pub async fn process_succession(
         &mut self,
         succession: &SuccessionRecord,
         admin: &AdminKeySet,
     ) -> Result<()> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            Error::database_error(
-                "Database transaction failed",
-                format!("Failed to begin transaction: {}", e),
-            )
-        })?;
+        self.check_rate_limit()?;
 
-        if !self.proof_system.verify_succession(succession, admin)? {
+        timeout(OPERATION_TIMEOUT, async {
+            let write_txn = self.db.begin_write().map_err(|e| {
+                Error::database_error(
+                    "Database transaction failed",
+                    format!("Failed to begin transaction: {}", e),
+                )
+            })?;
+
+            if !self.proof_system.verify_succession(succession, admin)? {
+                let audit_details = json!({
+                    "error": "invalid_succession",
+                    "from_generation": admin.policy_generation,
+                    "to_generation": succession.generation,
+                });
+                self.write_audit_log(
+                    &write_txn,
+                    "succession_verification_failed".into(),
+                    admin.policy_generation,
+                    audit_details,
+                )?;
+
+                return Err(Error::invalid_succession(
+                    "Key succession validation failed",
+                    "Invalid succession record",
+                ));
+            }
+
+            {
+                let mut successions_table = write_txn.open_table(SUCCESSIONS).map_err(|e| {
+                    Error::database_error(
+                        "Database access failed",
+                        format!("Failed to open successions table: {}", e),
+                    )
+                })?;
+
+                let succession_bytes = serde_json::to_vec(succession).map_err(|e| {
+                    Error::database_error(
+                        "Serialization failed",
+                        format!("Failed to serialize succession: {}", e),
+                    )
+                })?;
+
+                let generation_bytes = succession.generation.to_be_bytes();
+                successions_table
+                    .insert(
+                        generation_bytes.as_slice() as &[u8],
+                        succession_bytes.as_ref() as &[u8],
+                    )
+                    .map_err(|e| {
+                        Error::database_error(
+                            "Database write failed",
+                            format!("Failed to insert succession: {}", e),
+                        )
+                    })?;
+            }
+
+            {
+                let mut admin_table = write_txn.open_table(ADMIN_STATE).map_err(|e| {
+                    Error::database_error(
+                        "Database access failed",
+                        format!("Failed to open admin state table: {}", e),
+                    )
+                })?;
+
+                let new_admin = AdminKeySet {
+                    active_keys: succession.new_keys,
+                    policy_generation: succession.generation,
+                    last_rotation: succession.timestamp,
+                };
+
+                let admin_bytes = serde_json::to_vec(&new_admin).map_err(|e| {
+                    Error::database_error(
+                        "Serialization failed",
+                        format!("Failed to serialize admin state: {}", e),
+                    )
+                })?;
+
+                admin_table
+                    .insert(
+                        b"current".as_slice() as &[u8],
+                        admin_bytes.as_ref() as &[u8],
+                    )
+                    .map_err(|e| {
+                        Error::database_error(
+                            "Database write failed",
+                            format!("Failed to update admin state: {}", e),
+                        )
+                    })?;
+            }
+
             let audit_details = json!({
-                "error": "invalid_succession",
                 "from_generation": admin.policy_generation,
                 "to_generation": succession.generation,
+                "affected_entries": succession.affected_entries.len(),
+                "timestamp": succession.timestamp,
             });
-            self.write_audit_log(
+            let hash = self.write_audit_log(
                 &write_txn,
-                "succession_verification_failed".into(),
+                "succession_completed".into(),
                 admin.policy_generation,
                 audit_details,
             )?;
+            self.update_last_audit_hash(hash);
 
-            return Err(Error::invalid_succession(
-                "Key succession validation failed",
-                "Invalid succession record",
-            ));
-        }
-
-        {
-            let mut successions_table = write_txn.open_table(SUCCESSIONS).map_err(|e| {
+            write_txn.commit().map_err(|e| {
                 Error::database_error(
-                    "Database access failed",
-                    format!("Failed to open successions table: {}", e),
+                    "Database transaction failed",
+                    format!("Failed to commit transaction: {}", e),
                 )
             })?;
 
-            let succession_bytes = serde_json::to_vec(succession).map_err(|e| {
-                Error::database_error(
-                    "Serialization failed",
-                    format!("Failed to serialize succession: {}", e),
-                )
-            })?;
-
-            let generation_bytes = succession.generation.to_be_bytes();
-            successions_table
-                .insert(
-                    generation_bytes.as_slice() as &[u8],
-                    succession_bytes.as_ref() as &[u8],
-                )
-                .map_err(|e| {
-                    Error::database_error(
-                        "Database write failed",
-                        format!("Failed to insert succession: {}", e),
-                    )
-                })?;
-        }
-
-        {
-            let mut admin_table = write_txn.open_table(ADMIN_STATE).map_err(|e| {
-                Error::database_error(
-                    "Database access failed",
-                    format!("Failed to open admin state table: {}", e),
-                )
-            })?;
-
-            let new_admin = AdminKeySet {
-                active_keys: succession.new_keys,
-                policy_generation: succession.generation,
-                last_rotation: succession.timestamp,
-            };
-
-            let admin_bytes = serde_json::to_vec(&new_admin).map_err(|e| {
-                Error::database_error(
-                    "Serialization failed",
-                    format!("Failed to serialize admin state: {}", e),
-                )
-            })?;
-
-            admin_table
-                .insert(
-                    b"current".as_slice() as &[u8],
-                    admin_bytes.as_ref() as &[u8],
-                )
-                .map_err(|e| {
-                    Error::database_error(
-                        "Database write failed",
-                        format!("Failed to update admin state: {}", e),
-                    )
-                })?;
-        }
-
-        let audit_details = json!({
-            "from_generation": admin.policy_generation,
-            "to_generation": succession.generation,
-            "affected_entries": succession.affected_entries.len(),
-            "timestamp": succession.timestamp,
-        });
-        let hash = self.write_audit_log(
-            &write_txn,
-            "succession_completed".into(),
-            admin.policy_generation,
-            audit_details,
-        )?;
-        self.update_last_audit_hash(hash);
-
-        write_txn.commit().map_err(|e| {
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
             Error::database_error(
-                "Database transaction failed",
-                format!("Failed to commit transaction: {}", e),
+                "Operation timeout",
+                "Succession operation exceeded timeout limit",
             )
-        })?;
-
-        Ok(())
+        })?
     }
 
     pub fn get_current_admin(&self) -> Result<AdminKeySet> {
@@ -591,62 +672,73 @@ impl Storage {
         }
     }
 
-    pub fn set_admin_state(&mut self, admin: &AdminKeySet) -> Result<()> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            Error::database_error(
-                "Database transaction failed",
-                format!("Failed to begin transaction: {}", e),
-            )
-        })?;
+    pub async fn set_admin_state(&mut self, admin: &AdminKeySet) -> Result<()> {
+        self.check_rate_limit()?;
 
-        let audit_details = json!({
-            "policy_generation": admin.policy_generation,
-            "timestamp": admin.last_rotation,
-        });
-        let hash = self.write_audit_log(
-            &write_txn,
-            "admin_state_updated".into(),
-            admin.policy_generation,
-            audit_details,
-        )?;
-        self.update_last_audit_hash(hash);
-
-        {
-            let mut admin_table = write_txn.open_table(ADMIN_STATE).map_err(|e| {
+        timeout(OPERATION_TIMEOUT, async {
+            let write_txn = self.db.begin_write().map_err(|e| {
                 Error::database_error(
-                    "Database access failed",
-                    format!("Failed to open admin state table: {}", e),
+                    "Database transaction failed",
+                    format!("Failed to begin transaction: {}", e),
                 )
             })?;
 
-            let admin_bytes = serde_json::to_vec(admin).map_err(|e| {
-                Error::database_error(
-                    "Serialization failed",
-                    format!("Failed to serialize admin state: {}", e),
-                )
-            })?;
+            let audit_details = json!({
+                "policy_generation": admin.policy_generation,
+                "timestamp": admin.last_rotation,
+            });
+            let hash = self.write_audit_log(
+                &write_txn,
+                "admin_state_updated".into(),
+                admin.policy_generation,
+                audit_details,
+            )?;
+            self.update_last_audit_hash(hash);
 
-            admin_table
-                .insert(
-                    b"current".as_slice() as &[u8],
-                    admin_bytes.as_ref() as &[u8],
-                )
-                .map_err(|e| {
+            {
+                let mut admin_table = write_txn.open_table(ADMIN_STATE).map_err(|e| {
                     Error::database_error(
-                        "Database write failed",
-                        format!("Failed to insert admin state: {}", e),
+                        "Database access failed",
+                        format!("Failed to open admin state table: {}", e),
                     )
                 })?;
-        }
 
-        write_txn.commit().map_err(|e| {
+                let admin_bytes = serde_json::to_vec(admin).map_err(|e| {
+                    Error::database_error(
+                        "Serialization failed",
+                        format!("Failed to serialize admin state: {}", e),
+                    )
+                })?;
+
+                admin_table
+                    .insert(
+                        b"current".as_slice() as &[u8],
+                        admin_bytes.as_ref() as &[u8],
+                    )
+                    .map_err(|e| {
+                        Error::database_error(
+                            "Database write failed",
+                            format!("Failed to insert admin state: {}", e),
+                        )
+                    })?;
+            }
+
+            write_txn.commit().map_err(|e| {
+                Error::database_error(
+                    "Database transaction failed",
+                    format!("Failed to commit transaction: {}", e),
+                )
+            })?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
             Error::database_error(
-                "Database transaction failed",
-                format!("Failed to commit transaction: {}", e),
+                "Operation timeout",
+                "Admin state update exceeded timeout limit",
             )
-        })?;
-
-        Ok(())
+        })?
     }
 }
 
@@ -659,8 +751,8 @@ mod tests {
     use tempfile::tempdir;
     use time::OffsetDateTime;
 
-    #[test]
-    fn test_storage_operations() {
+    #[tokio::test]
+    async fn test_storage_operations() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let mut storage = Storage::new(db_path).unwrap();
@@ -697,16 +789,16 @@ mod tests {
 
         entry.signature = storage.proof_system.sign_entry(&entry, &key_pair).unwrap();
 
-        storage.add_entry(&entry, &admin).unwrap();
-        assert!(storage.validate_entry(&entry.id.0, &admin).unwrap());
+        storage.add_entry(&entry, &admin).await.unwrap();
+        assert!(storage.validate_entry(&entry.id.0, &admin).await.unwrap());
 
         let mut tampered_entry = entry.clone();
         tampered_entry.metadata.created_at = fixed_time + time::Duration::hours(1);
-        assert!(storage.add_entry(&tampered_entry, &admin).is_err());
+        assert!(storage.add_entry(&tampered_entry, &admin).await.is_err());
     }
 
-    #[test]
-    fn test_timestamp_invariance() {
+    #[tokio::test]
+    async fn test_timestamp_invariance() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let mut storage = Storage::new(db_path).unwrap();
@@ -747,8 +839,8 @@ mod tests {
             };
 
             entry.signature = storage.proof_system.sign_entry(&entry, &key_pair).unwrap();
-            storage.add_entry(&entry, &admin).unwrap();
-            assert!(storage.validate_entry(&entry.id.0, &admin).unwrap());
+            storage.add_entry(&entry, &admin).await.unwrap();
+            assert!(storage.validate_entry(&entry.id.0, &admin).await.unwrap());
         }
     }
 }

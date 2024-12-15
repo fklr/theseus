@@ -73,7 +73,7 @@ impl ServiceValidator {
         let admin = self.admin_state.borrow().clone();
         let result = match self.storage.get_entry(&entry_id.0)? {
             Some(entry) if entry.service_id == self.service_def.id => {
-                self.storage.validate_entry(&entry_id.0, &admin)?
+                self.storage.validate_entry(&entry_id.0, &admin).await?
             }
             _ => false,
         };
@@ -180,6 +180,7 @@ mod tests {
         Arc::get_mut(&mut storage)
             .unwrap()
             .set_admin_state(&admin)
+            .await
             .unwrap();
 
         let service_def = ServiceDefinition {
@@ -224,10 +225,10 @@ mod tests {
             .sign_entry(&entry, &key_pair)
             .unwrap();
 
-        Arc::get_mut(&mut storage)
+        let _ = Arc::get_mut(&mut storage)
             .unwrap()
             .add_entry(&entry, &admin)
-            .unwrap();
+            .await;
 
         let validator =
             ServiceValidator::new(storage, service_def, Duration::from_secs(300)).unwrap();

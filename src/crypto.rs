@@ -242,7 +242,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signature, SigningKey};
     use rand::{rngs::OsRng, RngCore};
+    use tempfile::tempdir;
     use time::OffsetDateTime;
+
+    use crate::storage::Storage;
 
     fn generate_test_keys() -> (SigningKeyPair, SigningKeyPair) {
         let mut rng = OsRng;
@@ -306,9 +309,12 @@ mod tests {
             .unwrap());
     }
 
-    #[test]
-    fn test_succession() {
-        let proof_system = ProofSystem::new();
+    #[tokio::test]
+    async fn test_succession() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut storage = Storage::new(db_path).unwrap();
+
         let (old_key1, old_key2) = generate_test_keys();
         let (new_key1, new_key2) = generate_test_keys();
         let old_keys = [old_key1, old_key2];
@@ -322,17 +328,27 @@ mod tests {
             affected_entries: vec![],
         };
 
-        let record = proof_system
+        let record = storage
+            .proof_system()
             .process_succession(&request, &admin_set)
             .unwrap();
 
-        assert!(proof_system.verify_succession(&record, &admin_set).unwrap());
+        storage
+            .process_succession(&record, &admin_set)
+            .await
+            .unwrap();
+
+        assert!(storage
+            .proof_system()
+            .verify_succession(&record, &admin_set)
+            .unwrap());
 
         assert_eq!(record.timestamp, fixed_time);
 
         let mut tampered_record = record.clone();
         tampered_record.timestamp = fixed_time + time::Duration::hours(1);
-        assert!(!proof_system
+        assert!(!storage
+            .proof_system()
             .verify_succession(&tampered_record, &admin_set)
             .unwrap());
     }

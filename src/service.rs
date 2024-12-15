@@ -160,7 +160,7 @@ mod tests {
     async fn setup_test_validator() -> (ServiceValidator, SigningKeyPair, ACLEntry) {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let storage = Arc::new(Storage::new(db_path).unwrap());
+        let mut storage = Arc::new(Storage::new(db_path).unwrap());
 
         let mut rng = OsRng;
         let mut seed = [0u8; 32];
@@ -177,7 +177,10 @@ mod tests {
             last_rotation: fixed_time,
         };
 
-        storage.set_admin_state(&admin).unwrap();
+        Arc::get_mut(&mut storage)
+            .unwrap()
+            .set_admin_state(&admin)
+            .unwrap();
 
         let service_def = ServiceDefinition {
             id: service_id.clone(),
@@ -221,7 +224,10 @@ mod tests {
             .sign_entry(&entry, &key_pair)
             .unwrap();
 
-        storage.add_entry(&entry, &admin).unwrap();
+        Arc::get_mut(&mut storage)
+            .unwrap()
+            .add_entry(&entry, &admin)
+            .unwrap();
 
         let validator =
             ServiceValidator::new(storage, service_def, Duration::from_secs(300)).unwrap();

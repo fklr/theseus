@@ -73,7 +73,12 @@ impl ProofSystem {
             &v_blinding,
             32,
         )
-        .map_err(|e| Error::crypto_error(e.to_string()))?;
+        .map_err(|e| {
+            Error::crypto_error(
+                "Range proof generation failed",
+                format!("Failed to create range proof: {}", e),
+            )
+        })?;
 
         Ok(ValidationProof::new(
             entry.id,
@@ -107,11 +112,19 @@ impl ProofSystem {
             transcript.append_message(b"admin-key", key.as_bytes());
         }
 
-        let range_proof = RangeProof::from_bytes(&proof.proof_data)
-            .map_err(|e| Error::invalid_proof(e.to_string()))?;
+        let range_proof = RangeProof::from_bytes(&proof.proof_data).map_err(|e| {
+            Error::invalid_proof(
+                "Access proof validation failed",
+                format!("Invalid proof: {}", e),
+            )
+        })?;
 
-        let compressed_point = CompressedRistretto::from_slice(&proof.commitment)
-            .map_err(|e| Error::crypto_error(e.to_string()))?;
+        let compressed_point = CompressedRistretto::from_slice(&proof.commitment).map_err(|e| {
+            Error::crypto_error(
+                "Point decoding failed",
+                format!("Failed to construct Ristretto point: {}", e),
+            )
+        })?;
 
         range_proof
             .verify_single(
@@ -121,7 +134,7 @@ impl ProofSystem {
                 &compressed_point,
                 32,
             )
-            .map_err(|e| Error::verification_failed(e.to_string()))?;
+            .map_err(|e| Error::verification_failed("Verification failed", e.to_string()))?;
 
         Ok(true)
     }
@@ -134,7 +147,8 @@ impl ProofSystem {
         for (req_pair, admin_key) in request.current_keys.iter().zip(&current_admin.active_keys) {
             if req_pair.verifying_key != *admin_key {
                 return Err(Error::invalid_succession(
-                    "Current keys do not match admin set",
+                    "Key succession validation failed",
+                    "Invalid succession record",
                 ));
             }
         }

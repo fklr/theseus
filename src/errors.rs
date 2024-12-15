@@ -9,6 +9,7 @@ pub struct Error {
     span: Option<SourceSpan>,
     msg: String,
     kind: ErrorKind,
+    details: String,
 }
 
 #[derive(Debug)]
@@ -18,51 +19,73 @@ enum ErrorKind {
     InvalidSuccession,
     VerificationFailed,
     CryptoError,
+    DatabaseError,
 }
 
 impl Error {
-    pub fn invalid_entry(msg: impl Into<String>) -> Self {
+    pub fn invalid_entry(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
         Self {
             src: None,
             span: None,
             msg: msg.into(),
             kind: ErrorKind::InvalidEntry,
+            details,
         }
     }
 
-    pub fn invalid_proof(msg: impl Into<String>) -> Self {
+    pub fn invalid_proof(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details: String = details.into();
         Self {
             src: None,
             span: None,
             msg: msg.into(),
             kind: ErrorKind::InvalidProof,
+            details,
         }
     }
 
-    pub fn invalid_succession(msg: impl Into<String>) -> Self {
+    pub fn invalid_succession(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
         Self {
             src: None,
             span: None,
             msg: msg.into(),
             kind: ErrorKind::InvalidSuccession,
+            details,
         }
     }
 
-    pub fn verification_failed(msg: impl Into<String>) -> Self {
+    pub fn verification_failed(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
         Self {
             src: None,
             span: None,
             msg: msg.into(),
             kind: ErrorKind::VerificationFailed,
+            details,
         }
     }
 
-    pub fn crypto_error(msg: impl Into<String>) -> Self {
+    pub fn crypto_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
         Self {
             src: None,
             span: None,
             msg: msg.into(),
             kind: ErrorKind::CryptoError,
+            details,
+        }
+    }
+
+    pub fn database_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::DatabaseError,
+            details,
         }
     }
 
@@ -76,11 +99,12 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ErrorKind::InvalidEntry => write!(f, "Invalid entry: {}", self.msg),
-            ErrorKind::InvalidProof => write!(f, "Invalid proof: {}", self.msg),
-            ErrorKind::InvalidSuccession => write!(f, "Invalid succession: {}", self.msg),
-            ErrorKind::VerificationFailed => write!(f, "Verification failed: {}", self.msg),
-            ErrorKind::CryptoError => write!(f, "Cryptographic error: {}", self.msg),
+            ErrorKind::InvalidEntry => write!(f, "Access validation failed"),
+            ErrorKind::InvalidProof => write!(f, "Proof verification failed"),
+            ErrorKind::InvalidSuccession => write!(f, "Key succession validation failed"),
+            ErrorKind::VerificationFailed => write!(f, "Verification operation failed"),
+            ErrorKind::CryptoError => write!(f, "Cryptographic operation failed"),
+            ErrorKind::DatabaseError => write!(f, "Database operation failed"),
         }
     }
 }

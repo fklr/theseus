@@ -2,6 +2,10 @@
 name = "theseus"
 version = "0.1.0"
 edition = "2021"
+description = "Core lib for a zero-knowledge proof-based Access Control List (ACL) system"
+authors = ["@mekaem"]
+license = "MPL-2.0"
+repository = "https://github.com/mekaem/theseus"
 
 [dependencies]
 base64 = "0.22.1"

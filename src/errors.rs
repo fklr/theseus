@@ -17,9 +17,11 @@ enum ErrorKind {
     InvalidEntry,
     InvalidProof,
     InvalidSuccession,
+    ValidationFailed,
     VerificationFailed,
     CryptoError,
     DatabaseError,
+    RateLimited,
 }
 
 impl Error {
@@ -52,6 +54,17 @@ impl Error {
             span: None,
             msg: msg.into(),
             kind: ErrorKind::InvalidSuccession,
+            details,
+        }
+    }
+
+    pub fn validation_failed(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::ValidationFailed,
             details,
         }
     }
@@ -89,6 +102,17 @@ impl Error {
         }
     }
 
+    pub fn rate_limited(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::RateLimited,
+            details,
+        }
+    }
+
     pub fn with_source(mut self, source: String, span: impl Into<SourceSpan>) -> Self {
         self.src = Some(source);
         self.span = Some(span.into());
@@ -102,9 +126,11 @@ impl fmt::Display for Error {
             ErrorKind::InvalidEntry => write!(f, "Access validation failed"),
             ErrorKind::InvalidProof => write!(f, "Proof verification failed"),
             ErrorKind::InvalidSuccession => write!(f, "Key succession validation failed"),
+            ErrorKind::ValidationFailed => write!(f, "Batch validation operation failed"),
             ErrorKind::VerificationFailed => write!(f, "Verification operation failed"),
             ErrorKind::CryptoError => write!(f, "Cryptographic operation failed"),
             ErrorKind::DatabaseError => write!(f, "Database operation failed"),
+            ErrorKind::RateLimited => write!(f, "Rate limit exceeded"),
         }
     }
 }

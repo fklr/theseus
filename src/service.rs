@@ -160,7 +160,7 @@ mod tests {
     async fn setup_test_validator() -> (ServiceValidator, SigningKeyPair, ACLEntry) {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut storage = Arc::new(Storage::new(db_path).unwrap());
+        let mut storage = Arc::new(Storage::new(db_path, None).unwrap());
 
         let mut rng = OsRng;
         let mut seed = [0u8; 32];

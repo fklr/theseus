@@ -8,7 +8,7 @@ use std::{
 
 use crate::errors::{Error, Result};
 
-trait TimeSource: Send + Sync {
+pub trait TimeSource: Send + Sync {
     fn now(&self) -> u64;
 }
 struct SystemClock;
@@ -19,6 +19,23 @@ impl TimeSource for SystemClock {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+}
+
+pub struct MockClock {
+    pub now: AtomicU64,
+}
+
+impl TimeSource for MockClock {
+    fn now(&self) -> u64 {
+        self.now.load(Ordering::Acquire)
+    }
+}
+
+impl MockClock {
+    pub fn advance(&self, duration: Duration) {
+        self.now
+            .fetch_add(duration.as_millis() as u64, Ordering::Release);
     }
 }
 
@@ -35,7 +52,7 @@ impl RateLimit {
         Self::with_clock(window, max_operations, Arc::new(SystemClock))
     }
 
-    fn with_clock(window: Duration, max_operations: u64, clock: Arc<dyn TimeSource>) -> Self {
+    pub fn with_clock(window: Duration, max_operations: u64, clock: Arc<dyn TimeSource>) -> Self {
         let now = clock.now();
         Self {
             counter: AtomicU64::new(0),
@@ -98,23 +115,6 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct MockClock {
-        now: AtomicU64,
-    }
-
-    impl TimeSource for MockClock {
-        fn now(&self) -> u64 {
-            self.now.load(Ordering::Acquire)
-        }
-    }
-
-    impl MockClock {
-        fn advance(&self, duration: Duration) {
-            self.now
-                .fetch_add(duration.as_millis() as u64, Ordering::Release);
-        }
-    }
 
     #[test]
     fn test_rate_limiting() {

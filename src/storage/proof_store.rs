@@ -311,10 +311,13 @@ fn calculate_optimal_batch_size(total_entries: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::atomic::AtomicU64, time::Duration};
 
     use super::*;
-    use crate::types::{EntryMetadata, SerializableSignature, ServiceId, SigningKeyPair};
+    use crate::{
+        storage::rate_limit::MockClock,
+        types::{EntryMetadata, SerializableSignature, ServiceId, SigningKeyPair},
+    };
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
 
@@ -542,10 +545,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting() {
+        let clock = Arc::new(MockClock {
+            now: AtomicU64::new(0),
+        });
+
         let temp_dir = tempdir().unwrap();
         let db = Arc::new(Database::create(temp_dir.path().join("test.db")).unwrap());
 
-        let rate_limiter = Arc::new(RateLimit::new(Duration::from_millis(100), 2));
+        let rate_limiter = Arc::new(RateLimit::with_clock(
+            Duration::from_millis(100),
+            2,
+            clock.clone(),
+        ));
         let proof_system = Arc::new(ProofSystem::new());
 
         let store = ProofStore::new(
@@ -569,11 +580,14 @@ mod tests {
         assert!(store.add_entry(&entry, &admin).await.is_ok());
         assert!(store.validate_entry(&entry.id.0, &admin).await.is_ok());
 
+        // Advance time within the rate limit window
+        clock.advance(Duration::from_millis(50));
+
         // Third operation should fail due to rate limiting
         assert!(store.validate_entry(&entry.id.0, &admin).await.is_err());
 
-        // Wait for rate limit window to expire - use full second
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Advance time beyond the rate limit window
+        clock.advance(Duration::from_millis(100));
 
         // Operation should succeed again
         assert!(store.validate_entry(&entry.id.0, &admin).await.is_ok());

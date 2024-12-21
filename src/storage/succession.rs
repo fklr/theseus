@@ -10,7 +10,8 @@ use crate::{
     crypto::ProofSystem,
     errors::{Error, Result},
     types::{
-        ACLEntry, AdminKeySet, EntryMetadata, SerializableSignature, ServiceId, SuccessionRecord,
+        ACLEntry, AdminKeySet, AdminPolicy, EntryMetadata, SerializableSignature, ServiceId,
+        SuccessionRecord,
     },
 };
 
@@ -91,6 +92,26 @@ impl SuccessionManager {
 
             self.verify_succession_record(succession, admin)?;
 
+            let is_recovery = succession
+                .request_metadata
+                .as_ref()
+                .and_then(|m| m.get("is_recovery"))
+                .and_then(|v| v.as_bool())
+                .map_or(false, |v| v);
+
+            let updated_policy = self.update_admin_policy(&write_txn, succession, is_recovery)?;
+            let new_admin = AdminKeySet {
+                active_keys: updated_policy.administrators,
+                policy_generation: updated_policy.policy_generation,
+                last_rotation: succession.timestamp,
+            };
+
+            let admin_bytes = serde_json::to_vec(&new_admin).map_err(|e| {
+                Error::database_error("Failed to serialize admin state", e.to_string())
+            })?;
+
+            self.update_admin_state(&write_txn, ADMIN_KEY, &admin_bytes)?;
+
             let succession_bytes = serde_json::to_vec(succession).map_err(|e| {
                 Error::database_error("Failed to serialize succession record", e.to_string())
             })?;
@@ -109,18 +130,6 @@ impl SuccessionManager {
                         Error::database_error("Failed to insert succession", e.to_string())
                     })?;
             }
-
-            let new_admin = AdminKeySet {
-                active_keys: succession.new_keys,
-                policy_generation: succession.generation,
-                last_rotation: succession.timestamp,
-            };
-
-            let admin_bytes = serde_json::to_vec(&new_admin).map_err(|e| {
-                Error::database_error("Failed to serialize admin state", e.to_string())
-            })?;
-
-            self.update_admin_state(&write_txn, ADMIN_KEY, &admin_bytes)?;
 
             let chain_state = self.build_chain_state(succession, admin)?;
             self.chain_cache.insert(succession.generation, chain_state);
@@ -254,13 +263,6 @@ impl SuccessionManager {
         succession: &SuccessionRecord,
         admin: &AdminKeySet,
     ) -> Result<()> {
-        if succession.old_keys != admin.active_keys {
-            return Err(Error::invalid_succession(
-                "Invalid succession",
-                "Old keys do not match current admin keys",
-            ));
-        }
-
         if succession.generation <= admin.policy_generation {
             return Err(Error::invalid_succession(
                 "Invalid succession",
@@ -268,24 +270,142 @@ impl SuccessionManager {
             ));
         }
 
+        let is_recovery = succession
+            .request_metadata
+            .as_ref()
+            .and_then(|m| m.get("is_recovery"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let message = self
             .proof_system
             .create_succession_message(admin.policy_generation, &succession.new_keys);
 
-        let valid_signatures = succession
-            .signatures
-            .iter()
-            .zip(&admin.active_keys)
-            .all(|(sig, key)| key.verify(&message, &sig.0).is_ok());
+        if is_recovery {
+            let current_admin_policy = self.get_current_admin_policy()?;
 
-        if !valid_signatures {
-            return Err(Error::invalid_succession(
-                "Invalid succession",
-                "Signature verification failed",
-            ));
+            let recovery_keys = current_admin_policy.recovery_keys.ok_or_else(|| {
+                Error::invalid_succession(
+                    "Recovery attempted",
+                    "No recovery keys configured for this service",
+                )
+            })?;
+
+            let valid_recovery = succession
+                .signatures
+                .iter()
+                .zip(&recovery_keys)
+                .any(|(sig, key)| key.verify(&message, &sig.0).is_ok());
+
+            if !valid_recovery {
+                return Err(Error::invalid_succession(
+                    "Invalid recovery",
+                    "Recovery signature verification failed",
+                ));
+            }
+        } else {
+            if succession.old_keys != admin.active_keys {
+                return Err(Error::invalid_succession(
+                    "Invalid succession",
+                    "Old keys do not match current admin keys",
+                ));
+            }
+
+            let valid_signatures = succession
+                .signatures
+                .iter()
+                .zip(&admin.active_keys)
+                .all(|(sig, key)| key.verify(&message, &sig.0).is_ok());
+
+            if !valid_signatures {
+                return Err(Error::invalid_succession(
+                    "Invalid succession",
+                    "Signature verification failed",
+                ));
+            }
         }
 
         Ok(())
+    }
+
+    fn get_current_admin_policy(&self) -> Result<AdminPolicy> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::database_error("Transaction failed", e.to_string()))?;
+
+        let admin_table = read_txn.open_table(ADMIN_STATE).map_err(|e| {
+            Error::database_error("Failed to open admin state table", e.to_string())
+        })?;
+
+        let policy_bytes = admin_table
+            .get(b"admin_policy".as_slice())
+            .map_err(|e| Error::database_error("Failed to read admin policy", e.to_string()))?
+            .ok_or_else(|| Error::database_error("Not found", "No admin policy found"))?;
+
+        serde_json::from_slice(policy_bytes.value())
+            .map_err(|e| Error::database_error("Failed to deserialize admin policy", e.to_string()))
+    }
+
+    fn update_admin_policy(
+        &self,
+        txn: &redb::WriteTransaction,
+        succession: &SuccessionRecord,
+        is_recovery: bool,
+    ) -> Result<AdminPolicy> {
+        let mut current_policy = self.get_current_admin_policy()?;
+
+        current_policy.administrators = succession.new_keys;
+        current_policy.policy_generation = succession.generation;
+
+        if is_recovery {
+            if let Some(recovery_metadata) = succession
+                .request_metadata
+                .as_ref()
+                .and_then(|m| m.get("recovery_policy_updates"))
+            {
+                if let Some(new_recovery_keys) = recovery_metadata.get("new_recovery_keys") {
+                    let key_bytes: [[u8; 32]; 2] =
+                        serde_json::from_value(new_recovery_keys.clone()).map_err(|e| {
+                            Error::invalid_succession(
+                                "Invalid recovery keys format",
+                                format!("Failed to parse recovery keys: {}", e),
+                            )
+                        })?;
+
+                    let recovery_keys = [
+                        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes[0]).map_err(|e| {
+                            Error::invalid_succession(
+                                "Invalid recovery key",
+                                format!("Failed to parse first recovery key: {}", e),
+                            )
+                        })?,
+                        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes[1]).map_err(|e| {
+                            Error::invalid_succession(
+                                "Invalid recovery key",
+                                format!("Failed to parse second recovery key: {}", e),
+                            )
+                        })?,
+                    ];
+
+                    current_policy.recovery_keys = Some(recovery_keys);
+                }
+            }
+        }
+
+        let policy_bytes = serde_json::to_vec(&current_policy).map_err(|e| {
+            Error::database_error("Failed to serialize updated admin policy", e.to_string())
+        })?;
+
+        let mut admin_table = txn.open_table(ADMIN_STATE).map_err(|e| {
+            Error::database_error("Failed to open admin state table", e.to_string())
+        })?;
+
+        admin_table
+            .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+            .map_err(|e| Error::database_error("Failed to update admin policy", e.to_string()))?;
+
+        Ok(current_policy)
     }
 
     pub fn get_proof_system(&self) -> &ProofSystem {
@@ -463,9 +583,10 @@ mod tests {
     use super::*;
     use crate::{
         storage::{rate_limit::MockClock, ENTRIES, PROOFS},
-        types::{EntryId, SigningKeyPair},
+        types::{EntryId, SigningKeyPair, SuccessionPolicy},
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
     use tempfile::tempdir;
 
     async fn setup_test_succession() -> (SuccessionManager, SigningKeyPair, AdminKeySet) {
@@ -475,14 +596,52 @@ mod tests {
         let proof_system = Arc::new(ProofSystem::new());
 
         // Initialize database tables
+        let write_txn = db.begin_write().unwrap();
+        write_txn.open_table(SUCCESSIONS).unwrap();
+        write_txn.open_table(ADMIN_STATE).unwrap();
+        write_txn.open_table(ENTRIES).unwrap();
+        write_txn.open_table(PROOFS).unwrap();
+        write_txn.commit().unwrap();
+
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let key_pair = SigningKeyPair::new(signing_key);
+        let recovery_key = SigningKeyPair::new(SigningKey::from_bytes(&[2u8; 32]));
+
+        // Create initial admin state and policy
+        let admin = AdminKeySet {
+            active_keys: [key_pair.verifying_key; 2],
+            policy_generation: 1,
+            last_rotation: time::OffsetDateTime::now_utc(),
+        };
+
+        let initial_policy = AdminPolicy {
+            administrators: admin.active_keys,
+            policy_generation: admin.policy_generation,
+            succession_requirements: SuccessionPolicy {
+                min_key_age: time::Duration::hours(24),
+                required_signatures: 2,
+            },
+            recovery_keys: Some([recovery_key.verifying_key; 2]),
+        };
+
+        // Initialize admin policy and state
+        let write_txn = db.begin_write().unwrap();
         {
-            let write_txn = db.begin_write().unwrap();
-            write_txn.open_table(SUCCESSIONS).unwrap();
-            write_txn.open_table(ADMIN_STATE).unwrap();
-            write_txn.open_table(ENTRIES).unwrap();
-            write_txn.open_table(PROOFS).unwrap();
-            write_txn.commit().unwrap();
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).unwrap();
+
+            // Store policy
+            let policy_bytes = serde_json::to_vec(&initial_policy).unwrap();
+            admin_table
+                .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+                .unwrap();
+
+            // Store admin state
+            let admin_bytes = serde_json::to_vec(&admin).unwrap();
+            admin_table
+                .insert(ADMIN_KEY, admin_bytes.as_slice())
+                .unwrap();
         }
+        write_txn.commit().unwrap();
 
         let proof_store = Arc::new(
             ProofStore::new(
@@ -502,15 +661,6 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
-
-        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
-        let key_pair = SigningKeyPair::new(signing_key);
-
-        let admin = AdminKeySet {
-            active_keys: [key_pair.verifying_key; 2],
-            policy_generation: 1,
-            last_rotation: time::OffsetDateTime::now_utc(),
-        };
 
         (manager, key_pair, admin)
     }
@@ -712,13 +862,58 @@ mod tests {
 
         let temp_dir = tempdir().unwrap();
         let db = Arc::new(Database::create(temp_dir.path().join("test.db")).unwrap());
-
         let rate_limiter = Arc::new(RateLimit::with_clock(
             Duration::from_millis(100),
             3,
             clock.clone(),
         ));
         let proof_system = Arc::new(ProofSystem::new());
+
+        // Initialize database tables and policies
+        let write_txn = db.begin_write().unwrap();
+        write_txn.open_table(SUCCESSIONS).unwrap();
+        write_txn.open_table(ADMIN_STATE).unwrap();
+        write_txn.open_table(ENTRIES).unwrap();
+        write_txn.open_table(PROOFS).unwrap();
+        write_txn.commit().unwrap();
+
+        let key_pair = SigningKeyPair::new(SigningKey::from_bytes(&[1u8; 32]));
+        let recovery_key = SigningKeyPair::new(SigningKey::from_bytes(&[2u8; 32]));
+
+        let admin = AdminKeySet {
+            active_keys: [key_pair.verifying_key; 2],
+            policy_generation: 1,
+            last_rotation: time::OffsetDateTime::now_utc(),
+        };
+
+        // Initialize admin state and policy
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).unwrap();
+
+            // Set up initial policy
+            let initial_policy = AdminPolicy {
+                administrators: admin.active_keys,
+                policy_generation: admin.policy_generation,
+                succession_requirements: SuccessionPolicy {
+                    min_key_age: time::Duration::hours(24),
+                    required_signatures: 2,
+                },
+                recovery_keys: Some([recovery_key.verifying_key; 2]),
+            };
+
+            let policy_bytes = serde_json::to_vec(&initial_policy).unwrap();
+            admin_table
+                .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+                .unwrap();
+
+            // Set up admin state
+            let admin_bytes = serde_json::to_vec(&admin).unwrap();
+            admin_table
+                .insert(ADMIN_KEY, admin_bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
 
         let proof_store = Arc::new(
             ProofStore::new(
@@ -739,13 +934,6 @@ mod tests {
         )
         .unwrap();
 
-        let key_pair = SigningKeyPair::new(SigningKey::from_bytes(&[1u8; 32]));
-        let admin = AdminKeySet {
-            active_keys: [key_pair.verifying_key; 2],
-            policy_generation: 1,
-            last_rotation: time::OffsetDateTime::now_utc(),
-        };
-
         let entry = create_test_entry([1u8; 32], 1, &key_pair, manager.get_proof_system());
         manager.proof_store.add_entry(&entry, &admin).await.unwrap();
 
@@ -758,32 +946,189 @@ mod tests {
             manager.get_proof_system(),
         );
 
-        // First operation should succeed
+        // Rate limit testing sequence
         assert!(manager
             .process_succession(&succession, &admin)
             .await
             .is_ok());
-
-        // Second operation should succeed
         assert!(manager
             .validate_across_chain(&[entry.clone()], 1, 2)
             .await
             .is_ok());
 
-        // Advance time within the rate limit window
         clock.advance(Duration::from_millis(50));
-
-        // Third operation should fail with rate limit error
         let err = manager
             .validate_across_chain(&[entry.clone()], 1, 2)
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "Rate limit exceeded");
 
-        // Advance time beyond the rate limit window
         clock.advance(Duration::from_millis(100));
-
-        // Operation should succeed after window reset
         assert!(manager.validate_across_chain(&[entry], 1, 2).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_normal_succession() {
+        let (manager, key_pair, admin) = setup_test_succession().await;
+        let entry = create_test_entry([1u8; 32], 1, &key_pair, manager.get_proof_system());
+        manager.proof_store.add_entry(&entry, &admin).await.unwrap();
+
+        let succession = create_test_succession(
+            admin.active_keys,
+            admin.active_keys,
+            2,
+            vec![entry.id],
+            &key_pair,
+            manager.get_proof_system(),
+        );
+
+        assert!(manager
+            .process_succession(&succession, &admin)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_succession() {
+        let (manager, admin_key_pair, admin) = setup_test_succession().await;
+
+        // Create recovery keys
+        let recovery_key = SigningKeyPair::new(SigningKey::from_bytes(&[2u8; 32]));
+
+        // Set up admin policy with recovery keys
+        let policy = AdminPolicy {
+            administrators: admin.active_keys,
+            policy_generation: admin.policy_generation,
+            succession_requirements: SuccessionPolicy {
+                min_key_age: time::Duration::hours(24),
+                required_signatures: 2,
+            },
+            recovery_keys: Some([recovery_key.verifying_key; 2]),
+        };
+
+        // Update admin policy in storage
+        let write_txn = manager.db.begin_write().unwrap();
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        {
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).unwrap();
+            admin_table
+                .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        // Create test entry
+        let entry = create_test_entry([1u8; 32], 1, &admin_key_pair, manager.get_proof_system());
+        manager.proof_store.add_entry(&entry, &admin).await.unwrap();
+
+        // Create recovery succession record
+        let mut succession = create_test_succession(
+            admin.active_keys,
+            [recovery_key.verifying_key; 2],
+            admin.policy_generation + 1,
+            vec![entry.id],
+            &recovery_key,
+            manager.get_proof_system(),
+        );
+
+        // Add recovery metadata
+        succession.request_metadata = Some(json!({
+            "is_recovery": true,
+            "reason": "Emergency key rotation"
+        }));
+
+        assert!(manager
+            .process_succession(&succession, &admin)
+            .await
+            .is_ok());
+
+        // Verify new admin state
+        let new_admin = manager.get_current_admin().unwrap();
+        assert_eq!(new_admin.active_keys, succession.new_keys);
+        assert_eq!(new_admin.policy_generation, succession.generation);
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_recovery() {
+        let (manager, admin_key_pair, admin) = setup_test_succession().await;
+
+        // Create unauthorized keys
+        let unauthorized_key = SigningKeyPair::new(SigningKey::from_bytes(&[3u8; 32]));
+
+        let entry = create_test_entry([1u8; 32], 1, &admin_key_pair, manager.get_proof_system());
+        manager.proof_store.add_entry(&entry, &admin).await.unwrap();
+
+        // Create unauthorized succession record
+        let mut succession = create_test_succession(
+            admin.active_keys,
+            [unauthorized_key.verifying_key; 2],
+            admin.policy_generation + 1,
+            vec![entry.id],
+            &unauthorized_key,
+            manager.get_proof_system(),
+        );
+
+        succession.request_metadata = Some(json!({
+            "is_recovery": true,
+            "reason": "Unauthorized attempt"
+        }));
+
+        assert!(manager
+            .process_succession(&succession, &admin)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_policy_preservation() {
+        let (manager, admin_key_pair, admin) = setup_test_succession().await;
+
+        // Create recovery keys
+        let recovery_key = SigningKeyPair::new(SigningKey::from_bytes(&[2u8; 32]));
+        let initial_policy = AdminPolicy {
+            administrators: admin.active_keys,
+            policy_generation: admin.policy_generation,
+            succession_requirements: SuccessionPolicy {
+                min_key_age: time::Duration::hours(24),
+                required_signatures: 2,
+            },
+            recovery_keys: Some([recovery_key.verifying_key; 2]),
+        };
+
+        // Set initial policy
+        let write_txn = manager.db.begin_write().unwrap();
+        let policy_bytes = serde_json::to_vec(&initial_policy).unwrap();
+        {
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).unwrap();
+            admin_table
+                .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        // Perform normal succession
+        let new_admin_key = SigningKeyPair::new(SigningKey::from_bytes(&[3u8; 32]));
+        let succession = create_test_succession(
+            admin.active_keys,
+            [new_admin_key.verifying_key; 2],
+            admin.policy_generation + 1,
+            vec![],
+            &admin_key_pair,
+            manager.get_proof_system(),
+        );
+
+        manager
+            .process_succession(&succession, &admin)
+            .await
+            .unwrap();
+
+        // Verify policy state
+        let updated_policy = manager.get_current_admin_policy().unwrap();
+        assert_eq!(updated_policy.administrators, succession.new_keys);
+        assert_eq!(updated_policy.policy_generation, succession.generation);
+        assert_eq!(
+            updated_policy.recovery_keys.unwrap(),
+            initial_policy.recovery_keys.unwrap()
+        );
     }
 }

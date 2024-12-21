@@ -64,6 +64,28 @@ impl Storage {
             Database::create(path)
                 .map_err(|e| Error::database_error("Failed to create database", e.to_string()))?,
         );
+
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| Error::database_error("Failed to begin transaction", e.to_string()))?;
+
+        write_txn
+            .open_table(ENTRIES)
+            .map_err(|e| Error::database_error("Failed to create entries table", e.to_string()))?;
+        write_txn.open_table(ADMIN_STATE).map_err(|e| {
+            Error::database_error("Failed to create admin state table", e.to_string())
+        })?;
+        write_txn
+            .open_table(PROOFS)
+            .map_err(|e| Error::database_error("Failed to create proofs table", e.to_string()))?;
+        write_txn.open_table(SUCCESSIONS).map_err(|e| {
+            Error::database_error("Failed to create successions table", e.to_string())
+        })?;
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::database_error("Failed to commit transaction", e.to_string()))?;
+
         let proof_system = Arc::new(ProofSystem::new());
         let rate_limiter = Arc::new(RateLimit::new(config.rate_window, config.max_operations));
 
@@ -263,7 +285,9 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EntryMetadata, SerializableSignature, ServiceId, SigningKeyPair};
+    use crate::types::{
+        EntryMetadata, SerializableSignature, ServiceId, SigningKeyPair, SuccessionPolicy,
+    };
     use ed25519_dalek::{Signature, SigningKey};
     use rand::{rngs::OsRng, RngCore};
     use tempfile::tempdir;
@@ -276,12 +300,39 @@ mod tests {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         let key_pair = SigningKeyPair::new(SigningKey::from_bytes(&seed));
+        let recovery_key = SigningKeyPair::new(SigningKey::from_bytes(&[2u8; 32]));
 
         let admin = AdminKeySet {
             active_keys: [key_pair.verifying_key; 2],
             policy_generation: 1,
             last_rotation: time::OffsetDateTime::now_utc(),
         };
+
+        let initial_policy = crate::types::AdminPolicy {
+            administrators: admin.active_keys,
+            policy_generation: admin.policy_generation,
+            succession_requirements: SuccessionPolicy {
+                min_key_age: time::Duration::hours(24),
+                required_signatures: 2,
+            },
+            recovery_keys: Some([recovery_key.verifying_key; 2]),
+        };
+
+        let write_txn = storage.db.begin_write().unwrap();
+        {
+            let mut admin_table = write_txn.open_table(ADMIN_STATE).unwrap();
+
+            let policy_bytes = serde_json::to_vec(&initial_policy).unwrap();
+            admin_table
+                .insert(b"admin_policy".as_slice(), policy_bytes.as_slice())
+                .unwrap();
+
+            let admin_bytes = serde_json::to_vec(&admin).unwrap();
+            admin_table
+                .insert(b"current".as_slice(), admin_bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
 
         (storage, key_pair, admin)
     }

@@ -20,6 +20,10 @@ enum ErrorKind {
     ValidationFailed,
     VerificationFailed,
     CryptoError,
+    CircuitError,
+    CommitmentError,
+    MerkleError,
+    SignatureError,
     DatabaseError,
     RateLimited,
 }
@@ -91,6 +95,47 @@ impl Error {
         }
     }
 
+    pub fn circuit_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::CircuitError,
+            details,
+        }
+    }
+
+    pub fn commitment_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::CommitmentError,
+            details: details.into(),
+        }
+    }
+
+    pub fn merkle_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::MerkleError,
+            details: details.into(),
+        }
+    }
+
+    pub fn signature_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::SignatureError,
+            details: details.into(),
+        }
+    }
+
     pub fn database_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
         let details = details.into();
         Self {
@@ -129,6 +174,10 @@ impl fmt::Display for Error {
             ErrorKind::ValidationFailed => write!(f, "Batch validation operation failed"),
             ErrorKind::VerificationFailed => write!(f, "Verification operation failed"),
             ErrorKind::CryptoError => write!(f, "Cryptographic operation failed"),
+            ErrorKind::CircuitError => write!(f, "Circuit operation failed"),
+            ErrorKind::CommitmentError => write!(f, "Commitment operation failed"),
+            ErrorKind::MerkleError => write!(f, "Merkle tree operation failed"),
+            ErrorKind::SignatureError => write!(f, "Signature operation failed"),
             ErrorKind::DatabaseError => write!(f, "Database operation failed"),
             ErrorKind::RateLimited => write!(f, "Rate limit exceeded"),
         }

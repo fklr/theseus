@@ -3,17 +3,76 @@ use crate::{
     crypto::primitives::{
         CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
     },
+    crypto::serialize::{IntoSerializable, SerializableG1, SerializableScalar},
     errors::Result,
 };
 use ark_ec::{AffineRepr, CurveGroup};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CircuitProof {
-    pub commitments: Vec<G1>,
-    pub responses: Vec<Scalar>,
-    pub evaluation_proof: G1,
+    pub commitments: Vec<SerializableG1>,
+    pub responses: Vec<SerializableScalar>,
+    pub evaluation_proof: SerializableG1,
+}
+
+impl CircuitProof {
+    pub fn new(commitments: Vec<G1>, responses: Vec<Scalar>, evaluation_proof: G1) -> Self {
+        Self {
+            commitments: commitments.into_serializable(),
+            responses: responses.into_serializable(),
+            evaluation_proof: evaluation_proof.into(),
+        }
+    }
+
+    pub fn commitments(&self) -> impl Iterator<Item = &G1> {
+        self.commitments.iter().map(|c| c.inner())
+    }
+
+    pub fn responses(&self) -> impl Iterator<Item = &Scalar> {
+        self.responses.iter().map(|r| r.inner())
+    }
+
+    pub fn evaluation_proof(&self) -> &G1 {
+        self.evaluation_proof.inner()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MerkleProof {
+    pub path: Vec<SerializableG1>,
+    pub siblings: Vec<SerializableG1>,
+    pub root: SerializableG1,
+    pub value: SerializableG1,
+}
+
+impl MerkleProof {
+    pub fn new(path: Vec<G1>, siblings: Vec<G1>, root: G1, value: G1) -> Self {
+        Self {
+            path: path.into_serializable(),
+            siblings: siblings.into_serializable(),
+            root: root.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn path(&self) -> impl Iterator<Item = &G1> {
+        self.path.iter().map(|p| p.inner())
+    }
+
+    pub fn siblings(&self) -> impl Iterator<Item = &G1> {
+        self.siblings.iter().map(|s| s.inner())
+    }
+
+    pub fn root(&self) -> &G1 {
+        self.root.inner()
+    }
+
+    pub fn value(&self) -> &G1 {
+        self.value.inner()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36,10 +95,14 @@ impl ProofSystem {
         }
     }
 
-    pub fn prove(&self, circuit: &Circuit) -> Result<CircuitProof> {
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF);
+    pub fn groups(&self) -> Arc<CurveGroups> {
+        Arc::clone(&self.groups)
+    }
 
-        // Generate blindings and commitments
+    pub fn prove(&self, circuit: &Circuit) -> Result<CircuitProof> {
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF, Arc::clone(&self.groups));
+
         let blindings: Vec<_> = (0..circuit.next_var)
             .into_par_iter()
             .map(|_| self.rng.random_scalar())
@@ -50,9 +113,8 @@ impl ProofSystem {
             .map(|blinding| (self.groups.g1_generator * blinding).into_affine())
             .collect();
 
-        // Proper domain separation for proof components
         for commitment in &commitments {
-            transcript.append_point(DomainSeparationTags::COMMITMENT, commitment);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, commitment);
         }
 
         transcript.append_message(
@@ -73,9 +135,9 @@ impl ProofSystem {
         });
 
         Ok(CircuitProof {
-            commitments,
-            responses: blindings,
-            evaluation_proof,
+            commitments: commitments.into_serializable(),
+            responses: blindings.into_serializable(),
+            evaluation_proof: evaluation_proof.into(),
         })
     }
 
@@ -84,10 +146,11 @@ impl ProofSystem {
             return Ok(false);
         }
 
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF, Arc::clone(&self.groups));
 
         for commitment in &proof.commitments {
-            transcript.append_point(DomainSeparationTags::COMMITMENT, commitment);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, commitment);
         }
 
         transcript.append_message(
@@ -103,15 +166,16 @@ impl ProofSystem {
             .par_chunks(batch_size)
             .map(|constraint_batch| {
                 constraint_batch.iter().all(|constraint| {
-                    let left = verify_terms(&constraint.left, &proof.commitments, &challenge);
-                    let right = verify_terms(&constraint.right, &proof.commitments, &challenge);
-                    let output = verify_terms(&constraint.output, &proof.commitments, &challenge);
+                    let commitments: Vec<G1> = proof.commitments().cloned().collect();
+                    let left = verify_terms(&constraint.left, &commitments, &challenge);
+                    let right = verify_terms(&constraint.right, &commitments, &challenge);
+                    let output = verify_terms(&constraint.output, &commitments, &challenge);
 
                     let constraint_eval = (left + right - output).into_affine();
                     let expected = (self.groups.g1_generator
                         * evaluate_constraint(
                             constraint,
-                            &proof.responses,
+                            &proof.responses().cloned().collect::<Vec<_>>(),
                             &challenge,
                             &self.groups,
                         ))
@@ -131,12 +195,11 @@ impl ProofSystem {
         proof: &CircuitProof,
         challenge: &Scalar,
     ) -> bool {
+        let responses: Vec<_> = proof.responses().cloned().collect();
         let expected = circuit
             .constraints
             .par_iter()
-            .map(|constraint| {
-                evaluate_constraint(constraint, &proof.responses, challenge, &self.groups)
-            })
+            .map(|constraint| evaluate_constraint(constraint, &responses, challenge, &self.groups))
             .reduce_with(|acc, eval| acc + eval)
             .map(|total| (self.groups.g1_generator * total).into_affine())
             .unwrap_or(G1::zero());
@@ -269,7 +332,7 @@ mod tests {
 
         // Corrupt the proof by modifying a response
         if let Some(response) = proof.responses.get_mut(0) {
-            *response = rng.random_scalar();
+            *response = rng.random_scalar().into();
         }
 
         // Verify corrupted proof fails

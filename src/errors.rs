@@ -184,6 +184,36 @@ impl fmt::Display for Error {
     }
 }
 
+impl From<redb::TransactionError> for Error {
+    fn from(error: redb::TransactionError) -> Self {
+        Error::database_error("Transaction error", error.to_string())
+    }
+}
+
+impl From<redb::CommitError> for Error {
+    fn from(error: redb::CommitError) -> Self {
+        Error::database_error("Commit error", error.to_string())
+    }
+}
+
+impl From<redb::TableError> for Error {
+    fn from(error: redb::TableError) -> Self {
+        Error::database_error("Table error", error.to_string())
+    }
+}
+
+impl From<redb::StorageError> for Error {
+    fn from(error: redb::StorageError) -> Self {
+        Error::database_error("Storage error", error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Error::database_error("JSON serialization error", error.to_string())
+    }
+}
+
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;

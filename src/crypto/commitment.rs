@@ -1,9 +1,15 @@
+use std::sync::Arc;
+
 use crate::{
     crypto::{
-        primitives::{CurveGroups, DomainSeparationTags, ProofTranscript, Scalar, G1},
+        primitives::{
+            CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
+        },
+        serialize::SerializableG2,
         signatures::{AggregateSignature, BlsSignature},
     },
     errors::{Error, Result},
+    types::ACLEntry,
 };
 use ark_ec::CurveGroup;
 use serde::{Deserialize, Serialize};
@@ -28,7 +34,8 @@ pub struct StateMatrixEntry {
     access_level: u32,
     required_attrs: Vec<u8>,
     policy_generation: u32,
-    admin_keys: [[u8; 32]; 2],
+    threshold: u32,
+    signing_keys: Vec<SerializableG2>,
     revocation_status: Option<RevocationStatus>,
 }
 
@@ -61,8 +68,8 @@ impl PedersenCommitment {
             .map_err(|e| Error::commitment_error("Failed to serialize entry", e.to_string()))?;
 
         transcript.append_message(DomainSeparationTags::COMMITMENT, &serialized);
-        transcript.append_point(b"pedersen-g", &self.g);
-        transcript.append_point(b"pedersen-h", &self.h);
+        transcript.append_point_g1(b"pedersen-g", &self.g);
+        transcript.append_point_g1(b"pedersen-h", &self.h);
 
         let value_point = self.groups.hash_to_g1(&serialized)?;
 
@@ -84,8 +91,8 @@ impl PedersenCommitment {
             .map_err(|e| Error::commitment_error("Failed to serialize entry", e.to_string()))?;
 
         transcript.append_message(DomainSeparationTags::COMMITMENT, &serialized);
-        transcript.append_point(b"pedersen-g", &self.g);
-        transcript.append_point(b"pedersen-h", &self.h);
+        transcript.append_point_g1(b"pedersen-g", &self.g);
+        transcript.append_point_g1(b"pedersen-h", &self.h);
 
         let value_point = self.groups.hash_to_g1(&serialized)?;
 
@@ -116,7 +123,8 @@ impl StateMatrixCommitment {
     ) -> Result<()> {
         let aggregate = AggregateSignature::aggregate(&admin_signatures)?;
 
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::REVOCATION);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::REVOCATION, (*groups).into());
         let data = (&aggregate, &metadata);
         let serialized = serde_json::to_vec(&data).map_err(|e| {
             Error::commitment_error("Failed to serialize revocation", e.to_string())
@@ -144,6 +152,16 @@ impl StateMatrixCommitment {
             None => self.value,
         }
     }
+
+    pub fn from_entry(entry: &ACLEntry, groups: &CurveGroups) -> Result<Self> {
+        let rng = RandomGenerator::new();
+        let mut pedersen = PedersenCommitment::new(*groups);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::new(*groups));
+        let blinding = rng.random_scalar();
+
+        pedersen.commit_state_entry(StateMatrixEntry::from(entry), &blinding, &mut transcript)
+    }
 }
 
 impl StateMatrixEntry {
@@ -153,7 +171,8 @@ impl StateMatrixEntry {
         access_level: u32,
         required_attrs: Vec<u8>,
         policy_generation: u32,
-        admin_keys: [[u8; 32]; 2],
+        threshold: u32,
+        signing_keys: Vec<SerializableG2>,
     ) -> Self {
         Self {
             user_id,
@@ -161,7 +180,8 @@ impl StateMatrixEntry {
             access_level,
             required_attrs,
             policy_generation,
-            admin_keys,
+            threshold,
+            signing_keys,
             revocation_status: None,
         }
     }
@@ -186,20 +206,54 @@ impl StateMatrixEntry {
         self.policy_generation
     }
 
-    pub fn admin_keys(&self) -> &[[u8; 32]; 2] {
-        &self.admin_keys
+    pub fn signing_keys(&self) -> &Vec<SerializableG2> {
+        &self.signing_keys
+    }
+}
+
+impl From<&ACLEntry> for StateMatrixEntry {
+    fn from(entry: &ACLEntry) -> Self {
+        Self {
+            user_id: entry.id.0,
+            service_id: entry
+                .service_id
+                .0
+                .as_bytes()
+                .try_into()
+                .unwrap_or([0u8; 32]),
+            access_level: entry.metadata.access_level.unwrap_or(0),
+            required_attrs: entry
+                .metadata
+                .required_attributes
+                .clone()
+                .unwrap_or_default(),
+            policy_generation: entry.policy_generation,
+            threshold: entry.auth_proof.threshold,
+            signing_keys: entry
+                .auth_proof
+                .aggregate_signature
+                .public_keys
+                .iter()
+                .map(|k| std::convert::Into::<SerializableG2>::into(*k))
+                .collect::<Vec<SerializableG2>>(),
+            revocation_status: None,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{primitives::RandomGenerator, SparseMerkleTree};
+    use crate::crypto::{
+        primitives::{RandomGenerator, G2},
+        SparseMerkleTree,
+    };
+    use ark_ec::AffineRepr;
     use serde_json::json;
     use std::sync::Arc;
 
     fn create_test_commitment(groups: &Arc<CurveGroups>) -> StateMatrixCommitment {
-        let mut pedersen = PedersenCommitment::new((**groups).clone());
+        let mut pedersen = PedersenCommitment::new(**groups);
         let rng = RandomGenerator::new();
         let entry = StateMatrixEntry::new(
             [1u8; 32],
@@ -207,9 +261,10 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups.clone());
         pedersen
             .commit_state_entry(entry, &rng.random_scalar(), &mut transcript)
             .unwrap()
@@ -219,19 +274,19 @@ mod tests {
     fn test_state_matrix() {
         let groups = Arc::new(CurveGroups::new());
         let tree = SparseMerkleTree::new(Arc::clone(&groups));
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+        let mut pedersen = PedersenCommitment::new(*groups);
+        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups);
         let rng = RandomGenerator::new();
 
-        let entry = StateMatrixEntry {
-            user_id: [1u8; 32],
-            service_id: [2u8; 32],
-            access_level: 1,
-            required_attrs: vec![1, 2, 3],
-            policy_generation: 1,
-            admin_keys: [[3u8; 32], [4u8; 32]],
-            revocation_status: None,
-        };
+        let entry = StateMatrixEntry::new(
+            [1u8; 32],
+            [2u8; 32],
+            1,
+            vec![1, 2, 3],
+            1,
+            42u32,
+            vec![G2::zero().into()],
+        );
 
         let blinding = rng.random_scalar();
         let commitment = pedersen
@@ -255,8 +310,8 @@ mod tests {
     fn test_revocation() {
         let groups = Arc::new(CurveGroups::new());
         let rng = RandomGenerator::new();
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+        let mut pedersen = PedersenCommitment::new(*groups);
+        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups.clone());
 
         let entry = StateMatrixEntry::new(
             [1u8; 32],
@@ -264,7 +319,8 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
 
         let blinding = rng.random_scalar();

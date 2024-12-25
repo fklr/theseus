@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     crypto::{
         commitment::StateMatrixCommitment,
@@ -16,7 +18,7 @@ pub struct BlsSignature {
     pub(crate) public_key: G2,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AggregateSignature {
     pub(crate) aggregate: G1,
     pub(crate) public_keys: Vec<G2>,
@@ -90,7 +92,7 @@ pub struct SignedStateCommitment {
 
 impl BlsSignature {
     pub fn sign(message: &[u8], secret_key: &Scalar, groups: &CurveGroups) -> Result<Self> {
-        let mut transcript = ProofTranscript::new(b"theseus-bls-signature");
+        let mut transcript = ProofTranscript::new(b"theseus-bls-signature", Arc::new(*groups));
         transcript.append_message(b"message", message);
 
         let message_point = groups
@@ -243,8 +245,8 @@ mod tests {
     #[test]
     fn test_signed_state_matrix() {
         let groups = Arc::new(CurveGroups::new());
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+        let mut pedersen = PedersenCommitment::new(*groups);
+        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups.clone());
         let rng = RandomGenerator::new();
 
         // Create test entry
@@ -254,7 +256,8 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
 
         // Create commitment

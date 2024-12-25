@@ -2,20 +2,22 @@ use crate::{
     crypto::{
         commitment::StateMatrixCommitment,
         primitives::{CurveGroups, G1},
+        serialize::{IntoSerializable, SerializableG1},
     },
     errors::{Error, Result},
 };
 use ark_serialize::CanonicalSerialize;
 use dashmap::DashMap;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerkleProof {
-    pub path: Vec<G1>,
-    pub siblings: Vec<G1>,
-    pub root: G1,
-    pub value: G1,
+    pub path: Vec<SerializableG1>,
+    pub siblings: Vec<SerializableG1>,
+    pub root: SerializableG1,
+    pub value: SerializableG1,
 }
 
 pub struct SparseMerkleTree {
@@ -76,10 +78,10 @@ impl SparseMerkleTree {
         self.nodes.insert(key, value);
 
         let proof = MerkleProof {
-            path,
-            siblings,
-            root: current,
-            value,
+            path: path.into_serializable(),
+            siblings: siblings.into_serializable(),
+            root: current.into(),
+            value: value.into(),
         };
 
         self.proof_cache.insert(key, proof.clone());
@@ -113,7 +115,7 @@ impl SparseMerkleTree {
             };
         }
 
-        Ok(current == proof.root)
+        Ok(current == *proof.root)
     }
 
     pub fn batch_verify(&self, proofs: &[(G1, [u8; 32], MerkleProof)]) -> Result<Vec<bool>> {

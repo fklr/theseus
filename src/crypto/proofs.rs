@@ -1,12 +1,16 @@
 use crate::{
-    crypto::circuits::{Circuit, Constraint, Variable},
-    crypto::primitives::{
-        CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
+    crypto::{
+        circuits::{Circuit, Constraint, Variable},
+        primitives::{
+            CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
+        },
+        serialize::{IntoSerializable, SerializableG1, SerializableScalar},
     },
-    crypto::serialize::{IntoSerializable, SerializableG1, SerializableScalar},
     errors::Result,
+    types::{AdminKeySet, SuccessionRecord},
 };
 use ark_ec::{AffineRepr, CurveGroup};
+use ark_ff::{One, Zero};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -205,6 +209,40 @@ impl ProofSystem {
             .unwrap_or(G1::zero());
 
         proof.evaluation_proof == expected
+    }
+
+    pub fn verify_succession(
+        &self,
+        succession: &SuccessionRecord,
+        current_admin: &AdminKeySet,
+    ) -> Result<bool> {
+        let message = serde_json::to_vec(succession)?;
+        if !succession
+            .auth_proof
+            .aggregate_signature
+            .verify(&message, &self.groups)?
+        {
+            return Ok(false);
+        }
+
+        if succession.generation <= current_admin.policy_generation {
+            return Ok(false);
+        }
+
+        let mut circuit = Circuit::new(Arc::clone(&self.groups));
+
+        for _ in &succession.affected_entries {
+            let var = circuit.allocate_scalar(&Scalar::from(succession.generation as u64));
+            let constraint = Constraint {
+                left: vec![(Scalar::one(), var)],
+                right: vec![(Scalar::from(current_admin.policy_generation as u64), var)],
+                output: vec![(Scalar::zero(), circuit.allocate_variable())],
+            };
+            circuit.constraints.push(constraint);
+        }
+
+        let proof = self.prove(&circuit)?;
+        self.verify(&circuit, &proof)
     }
 }
 

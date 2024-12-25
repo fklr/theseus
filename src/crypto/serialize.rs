@@ -3,6 +3,7 @@ use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[derive(Copy)]
 pub struct SerializableG1(G1);
 pub struct SerializableG2(G2);
 pub struct SerializableScalar(Scalar);

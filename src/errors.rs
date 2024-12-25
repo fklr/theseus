@@ -26,6 +26,7 @@ enum ErrorKind {
     SignatureError,
     DatabaseError,
     RateLimited,
+    SerializationError,
 }
 
 impl Error {
@@ -158,6 +159,17 @@ impl Error {
         }
     }
 
+    pub fn serialization_error(msg: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            src: None,
+            span: None,
+            msg: msg.into(),
+            kind: ErrorKind::SerializationError,
+            details,
+        }
+    }
+
     pub fn with_source(mut self, source: String, span: impl Into<SourceSpan>) -> Self {
         self.src = Some(source);
         self.span = Some(span.into());
@@ -180,6 +192,7 @@ impl fmt::Display for Error {
             ErrorKind::SignatureError => write!(f, "Signature operation failed"),
             ErrorKind::DatabaseError => write!(f, "Database operation failed"),
             ErrorKind::RateLimited => write!(f, "Rate limit exceeded"),
+            ErrorKind::SerializationError => write!(f, "Serialization operation failed"),
         }
     }
 }
@@ -209,8 +222,14 @@ impl From<redb::StorageError> for Error {
 }
 
 impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
-        Error::database_error("JSON serialization error", error.to_string())
+    fn from(err: serde_json::Error) -> Self {
+        Error::serialization_error("JSON serialization error", err.to_string())
+    }
+}
+
+impl From<ark_serialize::SerializationError> for Error {
+    fn from(err: ark_serialize::SerializationError) -> Self {
+        Error::serialization_error("Arkworks serialization error", err.to_string())
     }
 }
 

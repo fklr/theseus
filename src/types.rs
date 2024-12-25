@@ -68,6 +68,19 @@ pub struct EntryMetadata {
     pub access_level: Option<u32>,
 }
 
+impl Default for EntryMetadata {
+    fn default() -> Self {
+        Self {
+            created_at: OffsetDateTime::now_utc(),
+            expires_at: None,
+            version: 1,
+            service_specific: serde_json::Value::Null,
+            required_attributes: None,
+            access_level: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceAccessRequest {
     pub service_id: ServiceId,
@@ -141,6 +154,16 @@ pub struct AdminKeySet {
     pub active_keys: Vec<SerializableG2>,
     pub policy_generation: u32,
     pub last_rotation: OffsetDateTime,
+}
+
+impl Default for AdminKeySet {
+    fn default() -> Self {
+        Self {
+            active_keys: Vec::new(),
+            policy_generation: 0,
+            last_rotation: time::OffsetDateTime::now_utc(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

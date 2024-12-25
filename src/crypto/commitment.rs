@@ -5,7 +5,7 @@ use crate::{
         primitives::{
             CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
         },
-        serialize::SerializableG2,
+        serialize::{SerializableG1, SerializableG2, SerializableScalar},
         signatures::{AggregateSignature, BlsSignature},
     },
     errors::{Error, Result},
@@ -20,10 +20,10 @@ pub struct PedersenCommitment {
     h: G1,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StateMatrixCommitment {
-    value: G1,
-    blinding: Scalar,
+    value: SerializableG1,
+    blinding: SerializableScalar,
     data: StateMatrixEntry,
 }
 
@@ -76,8 +76,8 @@ impl PedersenCommitment {
         let commitment = (value_point + self.h * blinding).into_affine();
 
         Ok(StateMatrixCommitment {
-            value: commitment,
-            blinding: *blinding,
+            value: commitment.into(),
+            blinding: SerializableScalar::from(*blinding),
             data: entry,
         })
     }
@@ -96,7 +96,7 @@ impl PedersenCommitment {
 
         let value_point = self.groups.hash_to_g1(&serialized)?;
 
-        let expected = (value_point + self.h * commitment.blinding).into_affine();
+        let expected = (value_point + self.h * *commitment.blinding).into_affine();
 
         Ok(commitment.value == expected)
     }
@@ -149,7 +149,7 @@ impl StateMatrixCommitment {
     pub fn get_revocation_data(&self) -> G1 {
         match &self.data.revocation_status {
             Some(status) => status.commitment,
-            None => self.value,
+            None => *self.value,
         }
     }
 
@@ -331,7 +331,7 @@ mod tests {
         // Initially not revoked - should return commitment value
         let unrevoked_data = commitment.value;
         assert!(!commitment.is_revoked());
-        assert_eq!(commitment.get_revocation_data(), unrevoked_data);
+        assert_eq!(commitment.get_revocation_data(), *unrevoked_data);
 
         // Create and apply revocation
         let secret_key = rng.random_scalar();
@@ -342,7 +342,7 @@ mod tests {
 
         // After revocation - should return different value
         assert!(commitment.is_revoked());
-        assert_ne!(commitment.get_revocation_data(), unrevoked_data);
+        assert_ne!(commitment.get_revocation_data(), *unrevoked_data);
     }
 
     #[test]

@@ -95,6 +95,20 @@ impl SparseMerkleTree {
             .collect()
     }
 
+    pub fn get_proof(&self, key: &[u8; 32]) -> Result<MerkleProof> {
+        if let Some(cached) = self.proof_cache.get(key) {
+            return Ok(cached.clone());
+        }
+
+        match self.nodes.get(key) {
+            Some(value) => self.insert(*key, *value.value()),
+            None => Err(Error::merkle_error(
+                "No value found for key",
+                "Key not present in tree",
+            )),
+        }
+    }
+
     pub fn verify_proof(&self, key: &[u8; 32], value: &G1, proof: &MerkleProof) -> Result<bool> {
         if !value.is_on_curve() || !proof.root.is_on_curve() {
             return Ok(false);

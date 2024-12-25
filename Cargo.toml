@@ -26,4 +26,5 @@ time = { version = "0.3.37", features = ["serde"] }
 tokio = { version = "1.42.0", features = ["full"] }
 
 [dev-dependencies]
+futures = "0.3.31"
 tempfile = "3.14.0"

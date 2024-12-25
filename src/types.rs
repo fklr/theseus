@@ -1,7 +1,10 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+use crate::{
+    crypto::{serialize::SerializableG2, signatures::AggregateSignature},
+    errors::Error,
+};
 
 //-----------------------------------------------------------------------------
 // Core Identifiers
@@ -18,96 +21,22 @@ impl EntryId {
     pub fn from_hash(data: &[u8]) -> Self {
         Self(blake3::hash(data).into())
     }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, Error> {
+        if slice.len() != 32 {
+            return Err(Error::invalid_entry(
+                "Invalid ID length",
+                "Entry ID must be 32 bytes",
+            ));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(slice);
+        Ok(Self(id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ServiceId(pub String);
-
-//-----------------------------------------------------------------------------
-// Cryptographic Types
-//-----------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct SerializableSignature(pub Signature);
-
-impl Serialize for SerializableSignature {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let bytes = self.0.to_bytes();
-        BASE64.encode(bytes).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SerializableSignature {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let b64 = String::deserialize(deserializer)?;
-        let bytes = BASE64
-            .decode(b64.as_bytes())
-            .map_err(serde::de::Error::custom)?;
-
-        let sig_bytes: [u8; 64] = bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("Invalid signature length"))?;
-
-        let sig = Signature::from_bytes(&sig_bytes);
-        Ok(SerializableSignature(sig))
-    }
-}
-
-#[derive(Debug)]
-pub struct SigningKeyPair {
-    pub signing_key: SigningKey,
-    pub verifying_key: VerifyingKey,
-}
-
-impl SigningKeyPair {
-    pub fn new(signing_key: SigningKey) -> Self {
-        let verifying_key = signing_key.verifying_key();
-        Self {
-            signing_key,
-            verifying_key,
-        }
-    }
-
-    pub fn sign(&self, message: &[u8]) -> SerializableSignature {
-        SerializableSignature(self.signing_key.sign(message))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationProof {
-    pub entry_id: EntryId,
-    pub proof_data: Vec<u8>,
-    pub generation: u32,
-    pub commitment: [u8; 32],
-}
-
-impl ValidationProof {
-    pub fn new(
-        entry_id: EntryId,
-        proof_data: Vec<u8>,
-        generation: u32,
-        commitment: [u8; 32],
-    ) -> Self {
-        Self {
-            entry_id,
-            proof_data,
-            generation,
-            commitment,
-        }
-    }
-
-    pub fn create_transcript(&self) -> merlin::Transcript {
-        let mut transcript = merlin::Transcript::new(b"theseus-entry-validation");
-        transcript.append_message(b"transcript-data", &self.commitment);
-        transcript
-    }
-}
 
 //-----------------------------------------------------------------------------
 // Access Control Types
@@ -119,7 +48,14 @@ pub struct ACLEntry {
     pub service_id: ServiceId,
     pub policy_generation: u32,
     pub metadata: EntryMetadata,
-    pub signature: SerializableSignature,
+    pub auth_proof: AuthProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProof {
+    pub aggregate_signature: AggregateSignature,
+    pub policy_generation: u32,
+    pub threshold: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,12 +64,14 @@ pub struct EntryMetadata {
     pub expires_at: Option<OffsetDateTime>,
     pub version: u32,
     pub service_specific: serde_json::Value,
+    pub required_attributes: Option<Vec<u8>>,
+    pub access_level: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceAccessRequest {
     pub service_id: ServiceId,
-    pub requester: VerifyingKey,
+    pub public_key: SerializableG2,
     pub expires_at: Option<OffsetDateTime>,
     pub metadata: serde_json::Value,
 }
@@ -141,8 +79,8 @@ pub struct ServiceAccessRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessGrant {
     pub request_id: EntryId,
-    pub granter: VerifyingKey,
-    pub signature: SerializableSignature,
+    pub granter: SerializableG2,
+    pub signature: AggregateSignature,
     pub timestamp: OffsetDateTime,
 }
 
@@ -185,10 +123,11 @@ pub struct ProofRequirement {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminPolicy {
-    pub administrators: [VerifyingKey; 2],
+    pub administrators: Vec<SerializableG2>,
+    pub threshold: u32,
     pub policy_generation: u32,
     pub succession_requirements: SuccessionPolicy,
-    pub recovery_keys: Option<[VerifyingKey; 2]>,
+    pub recovery_keys: Option<Vec<SerializableG2>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,25 +138,18 @@ pub struct SuccessionPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminKeySet {
-    pub active_keys: [VerifyingKey; 2],
+    pub active_keys: Vec<SerializableG2>,
     pub policy_generation: u32,
     pub last_rotation: OffsetDateTime,
 }
 
-#[derive(Debug)]
-pub struct SuccessionRequest {
-    pub current_keys: [SigningKeyPair; 2],
-    pub new_verifying_keys: [VerifyingKey; 2],
-    pub affected_entries: Vec<EntryId>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuccessionRecord {
-    pub old_keys: [VerifyingKey; 2],
-    pub new_keys: [VerifyingKey; 2],
+    pub old_keys: Vec<SerializableG2>,
+    pub new_keys: Vec<SerializableG2>,
     pub generation: u32,
     pub timestamp: OffsetDateTime,
     pub affected_entries: Vec<EntryId>,
-    pub signatures: [SerializableSignature; 2],
+    pub auth_proof: AuthProof,
     pub request_metadata: Option<serde_json::Value>,
 }

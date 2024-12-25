@@ -12,8 +12,10 @@ use theseus::errors::Result;
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use ark_ec::AffineRepr;
     use serde_json::json;
     use std::time::Instant;
+    use theseus::crypto::G2;
 
     struct TestSystem {
         groups: Arc<CurveGroups>,
@@ -28,7 +30,7 @@ mod integration_tests {
             let groups = Arc::new(CurveGroups::new());
             let merkle_tree = SparseMerkleTree::new(Arc::clone(&groups));
             let proof_system = ProofSystem::new(Arc::clone(&groups));
-            let pedersen = PedersenCommitment::new((*groups).clone());
+            let pedersen = PedersenCommitment::new(*groups);
             let rng = RandomGenerator::new();
 
             Self {
@@ -47,9 +49,11 @@ mod integration_tests {
                 1,
                 vec![1, 2, 3],
                 1,
-                [[3u8; 32], [4u8; 32]],
+                42u32,
+                vec![G2::zero().into()],
             );
-            let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+            let mut transcript =
+                ProofTranscript::new(DomainSeparationTags::COMMITMENT, self.groups.clone());
             let blinding = self.rng.random_scalar();
             self.pedersen
                 .commit_state_entry(entry, &blinding, &mut transcript)
@@ -111,15 +115,17 @@ mod integration_tests {
 
         for i in 0..test_count {
             let entry = StateMatrixEntry::new(
-                [i as u8; 32],
+                [1u8; 32],
                 [2u8; 32],
                 1,
                 vec![1, 2, 3],
                 1,
-                [[3u8; 32], [4u8; 32]],
+                42u32,
+                vec![G2::zero().into()],
             );
 
-            let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+            let mut transcript =
+                ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::clone(&system.groups));
             let commitment = system.pedersen.commit_state_entry(
                 entry,
                 &system.rng.random_scalar(),

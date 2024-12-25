@@ -1,11 +1,12 @@
-use crate::errors::Result;
 use ark_bls12_377::{Bls12_377, Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup};
-use ark_ff::{BigInteger, PrimeField, UniformRand};
+use ark_ff::{PrimeField, UniformRand};
 use ark_serialize::CanonicalSerialize;
 use blake3::Hasher;
-use merlin::Transcript;
 use rand::{thread_rng, RngCore};
+use std::sync::Arc;
+
+use crate::errors::Result;
 
 pub type Scalar = Fr;
 pub type G1 = G1Affine;
@@ -14,49 +15,100 @@ pub type GT = <Bls12_377 as Pairing>::TargetField;
 
 #[derive(Clone)]
 pub struct ProofTranscript {
-    inner: Transcript,
+    state: Vec<u8>,
+    groups: Arc<CurveGroups>,
 }
 
 impl ProofTranscript {
-    pub fn new(label: &'static [u8]) -> Self {
-        Self {
-            inner: Transcript::new(label),
+    pub fn new(domain: &[u8], groups: Arc<CurveGroups>) -> Self {
+        let mut state = Vec::new();
+        state.extend_from_slice(domain);
+        Self { state, groups }
+    }
+
+    pub fn append_message(&mut self, label: &[u8], message: &[u8]) {
+        self.state.extend_from_slice(label);
+        self.state
+            .extend_from_slice(&(message.len() as u64).to_le_bytes());
+        self.state.extend_from_slice(message);
+    }
+
+    pub fn append_scalar(&mut self, label: &[u8], scalar: &Scalar) {
+        let mut bytes = Vec::new();
+        scalar.serialize_compressed(&mut bytes).unwrap();
+        self.append_message(label, &bytes);
+    }
+
+    pub fn append_point_g1(&mut self, label: &[u8], point: &G1) {
+        let mut bytes = Vec::new();
+        point.serialize_compressed(&mut bytes).unwrap();
+        self.append_message(label, &bytes);
+    }
+
+    pub fn append_point_g2(&mut self, label: &[u8], point: &G2) {
+        let mut bytes = Vec::new();
+        point.serialize_compressed(&mut bytes).unwrap();
+        self.append_message(label, &bytes);
+    }
+
+    pub fn challenge_scalar(&mut self, label: &[u8]) -> Scalar {
+        self.state.extend_from_slice(label);
+        let point = self
+            .groups
+            .hash_to_g1(&self.state)
+            .expect("Hash should not fail");
+        let mut bytes = Vec::new();
+        point.serialize_compressed(&mut bytes).unwrap();
+        Scalar::from_le_bytes_mod_order(&bytes)
+    }
+
+    pub fn challenge_point_g1(&mut self, label: &[u8]) -> Result<G1> {
+        self.state.extend_from_slice(label);
+        self.groups.hash_to_g1(&self.state)
+    }
+
+    pub fn challenge_point_g2(&mut self, label: &[u8]) -> Result<G2> {
+        self.state.extend_from_slice(label);
+        self.groups.hash_to_g2(&self.state)
+    }
+
+    pub fn append_scalars<'a, I>(&mut self, label: &[u8], scalars: I)
+    where
+        I: IntoIterator<Item = &'a Scalar>,
+    {
+        for scalar in scalars {
+            self.append_scalar(label, scalar);
         }
     }
 
-    pub fn append_message(&mut self, label: &'static [u8], message: &[u8]) {
-        self.inner.append_message(label, message);
+    pub fn append_points_g1<'a, I>(&mut self, label: &[u8], points: I)
+    where
+        I: IntoIterator<Item = &'a G1>,
+    {
+        for point in points {
+            self.append_point_g1(label, point);
+        }
     }
 
-    pub fn append_point(&mut self, label: &'static [u8], point: &G1) {
-        let mut buf = Vec::new();
-        point.serialize_compressed(&mut buf).unwrap();
-        self.inner.append_message(label, &buf);
+    pub fn append_points_g2<'a, I>(&mut self, label: &[u8], points: I)
+    where
+        I: IntoIterator<Item = &'a G2>,
+    {
+        for point in points {
+            self.append_point_g2(label, point);
+        }
     }
 
-    pub fn append_g2_point(&mut self, label: &'static [u8], point: &G2) {
-        let mut buf = Vec::new();
-        point.serialize_compressed(&mut buf).unwrap();
-        self.inner.append_message(label, &buf);
+    pub fn clone_state(&self) -> Vec<u8> {
+        self.state.clone()
     }
 
-    pub fn append_scalar(&mut self, label: &'static [u8], scalar: &Scalar) {
-        self.inner
-            .append_message(label, &scalar.into_bigint().to_bytes_le());
-    }
-
-    pub fn challenge_scalar(&mut self, label: &'static [u8]) -> Scalar {
-        let mut buf = [0u8; 64];
-        self.inner.challenge_bytes(label, &mut buf);
-        Scalar::from_le_bytes_mod_order(&buf)
-    }
-
-    pub fn challenge_bytes(&mut self, label: &'static [u8], dest: &mut [u8]) {
-        self.inner.challenge_bytes(label, dest);
+    pub fn reset_with_state(&mut self, state: Vec<u8>) {
+        self.state = state;
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct CurveGroups {
     pub g1_generator: G1,
     pub g2_generator: G2,
@@ -140,7 +192,6 @@ impl CurveGroups {
     }
 }
 
-/// Domain separation tags for different protocol components
 pub struct DomainSeparationTags;
 
 impl DomainSeparationTags {
@@ -183,12 +234,13 @@ mod tests {
 
     #[test]
     fn test_transcript_operations() {
-        let mut transcript = ProofTranscript::new(b"test-protocol");
+        let groups = Arc::new(CurveGroups::new());
+        let mut transcript = ProofTranscript::new(b"test-protocol", Arc::clone(&groups));
         let scalar = Scalar::from(42u64);
         let point = G1::generator();
 
         transcript.append_scalar(b"test-scalar", &scalar);
-        transcript.append_point(b"test-point", &point);
+        transcript.append_point_g1(b"test-point", &point);
 
         let challenge = transcript.challenge_scalar(b"test-challenge");
         assert_ne!(challenge, Scalar::zero());
@@ -250,5 +302,97 @@ mod tests {
         let b1 = rng.random_bytes(32);
         let b2 = rng.random_bytes(32);
         assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn test_transcript_determinism() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let mut t2 = ProofTranscript::new(b"test", Arc::clone(&groups));
+
+        let scalar = Scalar::from(42u64);
+        let point_g1 = groups.random_g1();
+        let point_g2 = groups.random_g2();
+
+        // Perform identical operations
+        t1.append_scalar(b"s", &scalar);
+        t1.append_point_g1(b"p1", &point_g1);
+        t1.append_point_g2(b"p2", &point_g2);
+
+        t2.append_scalar(b"s", &scalar);
+        t2.append_point_g1(b"p1", &point_g1);
+        t2.append_point_g2(b"p2", &point_g2);
+
+        let challenge1 = t1.challenge_scalar(b"c");
+        let challenge2 = t2.challenge_scalar(b"c");
+
+        assert_eq!(challenge1, challenge2);
+    }
+
+    #[test]
+    fn test_transcript_domain_separation() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut t1 = ProofTranscript::new(b"domain1", Arc::clone(&groups));
+        let mut t2 = ProofTranscript::new(b"domain2", Arc::clone(&groups));
+
+        // Same message, different domains
+        t1.append_message(b"msg", b"test");
+        t2.append_message(b"msg", b"test");
+
+        let c1 = t1.challenge_scalar(b"c");
+        let c2 = t2.challenge_scalar(b"c");
+
+        assert_ne!(c1, c2);
+        assert_ne!(c1, Scalar::zero());
+        assert_ne!(c2, Scalar::zero());
+    }
+
+    #[test]
+    fn test_transcript_state_management() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
+
+        t1.append_message(b"m", b"test");
+        let state = t1.clone_state();
+        let c1 = t1.challenge_scalar(b"c");
+
+        let mut t2 = ProofTranscript::new(b"different", Arc::clone(&groups));
+        t2.reset_with_state(state);
+        let c2 = t2.challenge_scalar(b"c");
+
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_batch_operations() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let mut t2 = ProofTranscript::new(b"test", Arc::clone(&groups));
+
+        let scalars = vec![Scalar::from(1u64), Scalar::from(2u64), Scalar::from(3u64)];
+        let points_g1 = vec![groups.random_g1(), groups.random_g1(), groups.random_g1()];
+        let points_g2 = vec![groups.random_g2(), groups.random_g2(), groups.random_g2()];
+
+        // Test batch operations
+        t1.append_scalars(b"s", &scalars);
+        t1.append_points_g1(b"p1", &points_g1);
+        t1.append_points_g2(b"p2", &points_g2);
+
+        // Test individual operations
+        for scalar in &scalars {
+            t2.append_scalar(b"s", scalar);
+        }
+        for point in &points_g1 {
+            t2.append_point_g1(b"p1", point);
+        }
+        for point in &points_g2 {
+            t2.append_point_g2(b"p2", point);
+        }
+
+        assert_eq!(
+            t1.challenge_scalar(b"c"),
+            t2.challenge_scalar(b"c"),
+            "Batch and individual operations should produce identical transcripts"
+        );
     }
 }

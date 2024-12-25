@@ -2,6 +2,7 @@ use crate::{
     crypto::commitment::StateMatrixCommitment,
     crypto::merkle::MerkleProof,
     crypto::primitives::{CurveGroups, Scalar, G1},
+    crypto::signatures::AggregateSignature,
     errors::{Error, Result},
 };
 use ark_bls12_377::{Fq, Fr};
@@ -9,8 +10,6 @@ use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, One, PrimeField, Zero};
 use ark_serialize::CanonicalSerialize;
 use std::sync::Arc;
-
-use super::AggregateSignature;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Variable(pub(crate) usize);
@@ -183,7 +182,7 @@ impl Circuit {
 
     fn enforce_policy_requirements(&mut self, commitment: &StateMatrixCommitment) -> Result<()> {
         let admin_count =
-            self.allocate_scalar(&Scalar::from(commitment.data().admin_keys().len() as u64));
+            self.allocate_scalar(&Scalar::from(commitment.data().signing_keys().len() as u64));
 
         let threshold_constraint = Constraint {
             left: vec![(Scalar::one(), admin_count)],
@@ -329,7 +328,7 @@ mod tests {
     use crate::crypto::{
         commitment::StateMatrixEntry,
         primitives::{DomainSeparationTags, RandomGenerator},
-        BlsSignature, PedersenCommitment, ProofTranscript,
+        BlsSignature, PedersenCommitment, ProofTranscript, G2,
     };
     use ark_ec::CurveGroup;
     use serde_json::json;
@@ -344,15 +343,13 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [
-                rng.random_bytes(32).try_into().unwrap(),
-                rng.random_bytes(32).try_into().unwrap(),
-            ],
+            42u32,
+            vec![G2::zero().into()],
         );
 
-        let mut pedersen = PedersenCommitment::new((**groups).clone());
+        let mut pedersen = PedersenCommitment::new(**groups);
         let blinding = rng.random_scalar();
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT);
+        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups.clone());
 
         pedersen
             .commit_state_entry(entry, &blinding, &mut transcript)
@@ -361,10 +358,10 @@ mod tests {
 
     fn create_test_proof(groups: &Arc<CurveGroups>) -> MerkleProof {
         MerkleProof {
-            siblings: vec![groups.random_g1(), groups.random_g1()],
-            path: vec![groups.random_g1(), groups.random_g1()],
-            root: groups.random_g1(),
-            value: groups.random_g1(),
+            siblings: vec![groups.random_g1().into(), groups.random_g1().into()],
+            path: vec![groups.random_g1().into(), groups.random_g1().into()],
+            root: groups.random_g1().into(),
+            value: groups.random_g1().into(),
         }
     }
 
@@ -399,7 +396,7 @@ mod tests {
     fn test_merkle_constraints() {
         let groups = Arc::new(CurveGroups::new());
         let mut circuit = Circuit::new(Arc::clone(&groups));
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
+        let mut pedersen = PedersenCommitment::new(*groups);
         let rng = RandomGenerator::new();
 
         let entry = StateMatrixEntry::new(
@@ -408,19 +405,20 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
         let blinding = rng.random_scalar();
-        let mut transcript = ProofTranscript::new(b"test-commitment");
+        let mut transcript = ProofTranscript::new(b"test-commitment", groups.clone());
         let commitment = pedersen
             .commit_state_entry(entry, &blinding, &mut transcript)
             .expect("Failed to create commitment");
 
         let proof = MerkleProof {
-            siblings: vec![groups.random_g1(), groups.random_g1()],
-            path: vec![groups.random_g1(), groups.random_g1()],
-            root: groups.random_g1(),
-            value: *commitment.value(),
+            siblings: vec![groups.random_g1().into(), groups.random_g1().into()],
+            path: vec![groups.random_g1().into(), groups.random_g1().into()],
+            root: groups.random_g1().into(),
+            value: (*commitment.value()).into(),
         };
 
         circuit
@@ -434,7 +432,7 @@ mod tests {
     fn test_state_transition() {
         let groups = Arc::new(CurveGroups::new());
         let mut circuit = Circuit::new(Arc::clone(&groups));
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
+        let mut pedersen = PedersenCommitment::new(*groups);
         let rng = RandomGenerator::new();
 
         // Create old and new states
@@ -444,18 +442,20 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
         let new_entry = StateMatrixEntry::new(
             [1u8; 32],
             [2u8; 32],
             1,
             vec![1, 2, 3],
-            2, // Increased policy generation
-            [[3u8; 32], [4u8; 32]],
+            2, // Different policy generation
+            42u32,
+            vec![G2::zero().into()],
         );
 
-        let mut transcript = ProofTranscript::new(b"test-commitment");
+        let mut transcript = ProofTranscript::new(b"test-commitment", groups.clone());
         let old_state = pedersen
             .commit_state_entry(old_entry, &rng.random_scalar(), &mut transcript)
             .unwrap();
@@ -494,30 +494,42 @@ mod tests {
             1,
             vec![1, 2, 3],
             1,
-            [[3u8; 32], [4u8; 32]],
+            42u32,
+            vec![G2::zero().into()],
         );
 
-        let mut pedersen = PedersenCommitment::new((*groups).clone());
+        let mut pedersen = PedersenCommitment::new(*groups);
         let blinding = rng.random_scalar();
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::ACCESS_PROOF, groups.clone());
         let commitment = pedersen
             .commit_state_entry(entry, &blinding, &mut transcript)
             .expect("Failed to create commitment");
 
         // Generate valid Merkle proof with non-zero points
         let merkle_path = (0..2)
-            .map(|_| (groups.g1_generator * rng.random_scalar()).into_affine())
-            .collect();
-        let merkle_siblings = (0..2)
-            .map(|_| (groups.g1_generator * rng.random_scalar()).into_affine())
+            .map(|_| {
+                (groups.g1_generator * rng.random_scalar())
+                    .into_affine()
+                    .into()
+            })
             .collect();
 
-        let root = (groups.g1_generator * rng.random_scalar()).into_affine();
+        let merkle_siblings = (0..2)
+            .map(|_| {
+                (groups.g1_generator * rng.random_scalar())
+                    .into_affine()
+                    .into()
+            })
+            .collect();
+
         let proof = MerkleProof {
             siblings: merkle_siblings,
             path: merkle_path,
-            root,
-            value: *commitment.value(),
+            root: (groups.g1_generator * rng.random_scalar())
+                .into_affine()
+                .into(),
+            value: (*commitment.value()).into(),
         };
 
         // Create valid BLS signature

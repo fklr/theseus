@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    crypto::{serialize::SerializableG2, signatures::AggregateSignature},
+    crypto::{serialize::SerializableG2, signatures::AggregateSignature, CircuitProof},
     errors::Error,
 };
 
@@ -56,6 +56,7 @@ pub struct AuthProof {
     pub aggregate_signature: AggregateSignature,
     pub policy_generation: u32,
     pub threshold: u32,
+    pub succession_proof: Option<CircuitProof>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -106,6 +106,42 @@ impl ProofTranscript {
     pub fn reset_with_state(&mut self, state: Vec<u8>) {
         self.state = state;
     }
+
+    pub fn start_zk_proof(&mut self, proof_type: &[u8]) {
+        self.state.clear();
+        self.state.extend_from_slice(proof_type);
+    }
+
+    pub fn commit_blind(&mut self, value: &[u8], blinding: &Scalar) -> Result<G1> {
+        let mut data = self.state.clone();
+        data.extend_from_slice(value);
+
+        let value_point = self.groups.hash_to_g1(&data)?;
+        let blinded = (value_point + self.groups.g1_generator * blinding).into_affine();
+        self.append_point_g1(b"commitment", &blinded);
+        Ok(blinded)
+    }
+
+    pub fn generate_challenge_polynomial(&mut self, degree: usize) -> Vec<Scalar> {
+        let mut coefficients = Vec::with_capacity(degree + 1);
+        for i in 0..=degree {
+            let challenge = self.challenge_scalar(format!("poly-{}", i).as_bytes());
+            coefficients.push(challenge);
+        }
+        coefficients
+    }
+
+    pub fn batch_challenges(&mut self, count: usize) -> Vec<Scalar> {
+        let mut challenges = Vec::with_capacity(count);
+        let initial = self.challenge_scalar(b"batch-init");
+        challenges.push(initial);
+
+        for i in 1..count {
+            self.append_scalar(b"prev", &challenges[i - 1]);
+            challenges.push(self.challenge_scalar(format!("batch-{}", i).as_bytes()));
+        }
+        challenges
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +226,28 @@ impl CurveGroups {
         let scalar = rng.random_scalar();
         (self.g2_generator * scalar).into_affine()
     }
+
+    pub fn commit_to_polynomial(&self, coeffs: &[Scalar], blinding: &Scalar) -> Result<G1> {
+        let mut commitment = G1::zero().into_group();
+
+        for (i, coeff) in coeffs.iter().enumerate() {
+            commitment += self.g1_generator.into_group() * coeff * Scalar::from(i as u64);
+        }
+
+        commitment += self.g1_generator.into_group() * blinding;
+
+        Ok(commitment.into_affine())
+    }
+
+    pub fn aggregate_commitments(&self, commitments: &[G1], weights: &[Scalar]) -> G1 {
+        assert_eq!(commitments.len(), weights.len());
+
+        let mut result = G1::zero().into_group();
+        for (comm, weight) in commitments.iter().zip(weights.iter()) {
+            result += comm.into_group() * weight;
+        }
+        result.into_affine()
+    }
 }
 
 pub struct DomainSeparationTags;
@@ -201,6 +259,11 @@ impl DomainSeparationTags {
     pub const ACCESS_PROOF: &'static [u8] = b"theseus-access-proof-v1";
     pub const SUCCESSION_PROOF: &'static [u8] = b"theseus-succession-proof-v1";
     pub const MERKLE_NODE: &'static [u8] = b"theseus-merkle-node-v1";
+
+    pub const ZK_STATE_PROOF: &'static [u8] = b"theseus-zk-state-v1";
+    pub const ZK_POLICY_PROOF: &'static [u8] = b"theseus-zk-policy-v1";
+    pub const ZK_ATTRIBUTE_PROOF: &'static [u8] = b"theseus-zk-attribute-v1";
+    pub const ZK_SUCCESSION_PROOF: &'static [u8] = b"theseus-zk-succession-v1";
 }
 
 pub struct RandomGenerator;
@@ -393,6 +456,104 @@ mod tests {
             t1.challenge_scalar(b"c"),
             t2.challenge_scalar(b"c"),
             "Batch and individual operations should produce identical transcripts"
+        );
+    }
+
+    #[test]
+    fn test_zk_proof_transcript() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut transcript = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let rng = RandomGenerator::new();
+
+        // Test ZK proof transcript generation
+        transcript.start_zk_proof(DomainSeparationTags::ZK_STATE_PROOF);
+
+        let value = b"test value";
+        let blinding = rng.random_scalar();
+
+        let commitment = transcript.commit_blind(value, &blinding).unwrap();
+        assert!(!commitment.is_zero());
+
+        // Verify domain separation
+        let mut transcript2 = ProofTranscript::new(b"test", Arc::clone(&groups));
+        transcript2.start_zk_proof(DomainSeparationTags::ZK_POLICY_PROOF);
+
+        let commitment2 = transcript2.commit_blind(value, &blinding).unwrap();
+        assert_ne!(
+            commitment, commitment2,
+            "Different proof types should produce different commitments"
+        );
+    }
+
+    #[test]
+    fn test_polynomial_commitments() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut transcript = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let rng = RandomGenerator::new();
+
+        // Generate and commit to random polynomial
+        let coefficients = transcript.generate_challenge_polynomial(3);
+        assert_eq!(coefficients.len(), 4);
+
+        let blinding = rng.random_scalar();
+        let commitment = groups
+            .commit_to_polynomial(&coefficients, &blinding)
+            .unwrap();
+
+        // Verify commitment is non-zero and deterministic
+        assert!(!commitment.is_zero());
+
+        let commitment2 = groups
+            .commit_to_polynomial(&coefficients, &blinding)
+            .unwrap();
+        assert_eq!(commitment, commitment2);
+    }
+
+    #[test]
+    fn test_zk_batch_operations() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut transcript = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let rng = RandomGenerator::new();
+
+        // Generate multiple commitments
+        let count = 5;
+        let values: Vec<_> = (0..count)
+            .map(|i| format!("value{}", i).into_bytes())
+            .collect();
+        let blindings: Vec<_> = (0..count).map(|_| rng.random_scalar()).collect();
+
+        let commitments: Vec<_> = values
+            .iter()
+            .zip(&blindings)
+            .map(|(v, b)| transcript.commit_blind(v, b).unwrap())
+            .collect();
+
+        // Generate batch challenges
+        let challenges = transcript.batch_challenges(count);
+        assert_eq!(challenges.len(), count);
+
+        // Test commitment aggregation
+        let agg_commitment = groups.aggregate_commitments(&commitments, &challenges);
+        assert!(!agg_commitment.is_zero());
+    }
+
+    #[test]
+    fn test_challenge_independence() {
+        let groups = Arc::new(CurveGroups::new());
+        let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
+        let mut t2 = ProofTranscript::new(b"test", Arc::clone(&groups));
+
+        // Start different types of ZK proofs
+        t1.start_zk_proof(DomainSeparationTags::ZK_STATE_PROOF);
+        t2.start_zk_proof(DomainSeparationTags::ZK_ATTRIBUTE_PROOF);
+
+        // Verify challenges are independent
+        let c1 = t1.challenge_scalar(b"test");
+        let c2 = t2.challenge_scalar(b"test");
+
+        assert_ne!(
+            c1, c2,
+            "Challenges should be independent for different proof types"
         );
     }
 }

@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     crypto::{
-        primitives::{
-            CurveGroups, DomainSeparationTags, ProofTranscript, RandomGenerator, Scalar, G1,
-        },
+        primitives::{CurveGroups, DomainSeparationTags, ProofTranscript, Scalar, G1},
         serialize::{SerializableG1, SerializableG2, SerializableScalar},
         signatures::{AggregateSignature, BlsSignature},
     },
@@ -12,6 +10,7 @@ use crate::{
     types::ACLEntry,
 };
 use ark_ec::CurveGroup;
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 
 pub struct PedersenCommitment {
@@ -20,14 +19,14 @@ pub struct PedersenCommitment {
     h: G1,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateMatrixCommitment {
     value: SerializableG1,
     blinding: SerializableScalar,
     data: StateMatrixEntry,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateMatrixEntry {
     user_id: [u8; 32],
     service_id: [u8; 32],
@@ -39,7 +38,7 @@ pub struct StateMatrixEntry {
     revocation_status: Option<RevocationStatus>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevocationStatus {
     timestamp: time::OffsetDateTime,
     admin_signature: AggregateSignature,
@@ -154,13 +153,44 @@ impl StateMatrixCommitment {
     }
 
     pub fn from_entry(entry: &ACLEntry, groups: &CurveGroups) -> Result<Self> {
-        let rng = RandomGenerator::new();
         let mut pedersen = PedersenCommitment::new(*groups);
         let mut transcript =
             ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::new(*groups));
-        let blinding = rng.random_scalar();
 
-        pedersen.commit_state_entry(StateMatrixEntry::from(entry), &blinding, &mut transcript)
+        let matrix_entry = StateMatrixEntry {
+            user_id: entry.id.0,
+            service_id: entry
+                .service_id
+                .0
+                .as_bytes()
+                .try_into()
+                .unwrap_or([0u8; 32]),
+            access_level: entry.metadata.access_level.unwrap_or(0),
+            required_attrs: entry
+                .metadata
+                .required_attributes
+                .clone()
+                .unwrap_or_default(),
+            policy_generation: entry.policy_generation,
+            threshold: entry.auth_proof.threshold,
+            signing_keys: entry
+                .auth_proof
+                .aggregate_signature
+                .public_keys
+                .iter()
+                .map(|k| std::convert::Into::<SerializableG2>::into(*k))
+                .collect(),
+            revocation_status: None,
+        };
+
+        let blinding = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&entry.id.0);
+            hasher.update(&entry.policy_generation.to_le_bytes());
+            Scalar::from_le_bytes_mod_order(hasher.finalize().as_bytes())
+        };
+
+        pedersen.commit_state_entry(matrix_entry, &blinding, &mut transcript)
     }
 }
 

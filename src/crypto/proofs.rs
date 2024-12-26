@@ -10,7 +10,6 @@ use crate::{
     types::{AdminKeySet, SuccessionRecord},
 };
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{One, Zero};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -216,7 +215,7 @@ impl ProofSystem {
         succession: &SuccessionRecord,
         current_admin: &AdminKeySet,
     ) -> Result<bool> {
-        let message = serde_json::to_vec(succession)?;
+        let message = serde_json::to_vec(&succession.auth_proof.succession_proof)?;
         if !succession
             .auth_proof
             .aggregate_signature
@@ -225,24 +224,30 @@ impl ProofSystem {
             return Ok(false);
         }
 
-        if succession.generation <= current_admin.policy_generation {
-            return Ok(false);
+        if let Some(proof) = &succession.auth_proof.succession_proof {
+            let mut circuit = Circuit::new(Arc::clone(&self.groups));
+
+            let old_policy_var =
+                circuit.allocate_scalar(&Scalar::from(current_admin.policy_generation as u64));
+            let new_policy_var =
+                circuit.allocate_scalar(&Scalar::from(succession.generation as u64));
+
+            circuit.enforce_policy_transition(old_policy_var, new_policy_var);
+
+            for (old_key, new_key) in current_admin
+                .active_keys
+                .iter()
+                .zip(succession.new_keys.iter())
+            {
+                let old_key_point = circuit.allocate_g2_point(old_key.inner());
+                let new_key_point = circuit.allocate_g2_point(new_key.inner());
+                circuit.enforce_key_succession(old_key_point, new_key_point);
+            }
+
+            self.verify(&circuit, proof)
+        } else {
+            Ok(false)
         }
-
-        let mut circuit = Circuit::new(Arc::clone(&self.groups));
-
-        for _ in &succession.affected_entries {
-            let var = circuit.allocate_scalar(&Scalar::from(succession.generation as u64));
-            let constraint = Constraint {
-                left: vec![(Scalar::one(), var)],
-                right: vec![(Scalar::from(current_admin.policy_generation as u64), var)],
-                output: vec![(Scalar::zero(), circuit.allocate_variable())],
-            };
-            circuit.constraints.push(constraint);
-        }
-
-        let proof = self.prove(&circuit)?;
-        self.verify(&circuit, &proof)
     }
 }
 

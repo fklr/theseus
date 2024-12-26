@@ -24,6 +24,15 @@ pub struct AggregateSignature {
     pub(crate) public_keys: Vec<G2>,
 }
 
+impl Default for AggregateSignature {
+    fn default() -> Self {
+        Self {
+            aggregate: G1::zero(),
+            public_keys: Vec::new(),
+        }
+    }
+}
+
 impl Serialize for AggregateSignature {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where

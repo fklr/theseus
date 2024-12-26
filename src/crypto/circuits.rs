@@ -1,7 +1,7 @@
 use crate::{
     crypto::commitment::StateMatrixCommitment,
     crypto::merkle::MerkleProof,
-    crypto::primitives::{CurveGroups, Scalar, G1},
+    crypto::primitives::{CurveGroups, Scalar, G1, G2},
     crypto::signatures::AggregateSignature,
     errors::{Error, Result},
 };
@@ -42,9 +42,15 @@ impl Circuit {
         var
     }
 
-    pub fn allocate_point(&mut self, point: &G1) -> Variable {
+    pub fn allocate_g1_point(&mut self, point: &G1) -> Variable {
         let var = self.allocate_variable();
-        self.enforce_point_on_curve(point, var);
+        self.enforce_g1_point_on_curve(point, var);
+        var
+    }
+
+    pub fn allocate_g2_point(&mut self, point: &G2) -> Variable {
+        let var = self.allocate_variable();
+        self.enforce_g2_point_on_curve(point, var);
         var
     }
 
@@ -69,11 +75,11 @@ impl Circuit {
         root: &G1,
         leaf: &StateMatrixCommitment,
     ) -> Result<()> {
-        let leaf_var = self.allocate_point(leaf.value());
+        let leaf_var = self.allocate_g1_point(leaf.value());
         let mut current = leaf_var;
 
         for (idx, sibling) in proof.siblings.iter().enumerate() {
-            let sibling_var = self.allocate_point(sibling);
+            let sibling_var = self.allocate_g1_point(sibling);
             let output_var = self.allocate_variable();
 
             let is_right = (idx & 1) == 1;
@@ -96,7 +102,7 @@ impl Circuit {
             current = output_var;
         }
 
-        let root_var = self.allocate_point(root);
+        let root_var = self.allocate_g1_point(root);
         self.enforce_equal(current, root_var);
         Ok(())
     }
@@ -108,8 +114,8 @@ impl Circuit {
         aggregate_signature: &AggregateSignature,
         policy_generation: u32,
     ) -> Result<()> {
-        let old_var = self.allocate_point(old_state.value());
-        let new_var = self.allocate_point(new_state.value());
+        let old_var = self.allocate_g1_point(old_state.value());
+        let new_var = self.allocate_g1_point(new_state.value());
 
         let state_transition = Constraint {
             left: vec![(Scalar::one(), old_var)],
@@ -140,13 +146,13 @@ impl Circuit {
     }
 
     fn enforce_commitment_structure(&mut self, commitment: &StateMatrixCommitment) -> Result<()> {
-        let value_var = self.allocate_point(commitment.value());
+        let value_var = self.allocate_g1_point(commitment.value());
         let data_point = self.groups.hash_to_g1(
             &serde_json::to_vec(commitment.data())
                 .map_err(|e| Error::circuit_error("Serialization failed", e.to_string()))?,
         )?;
 
-        let data_var = self.allocate_point(&data_point);
+        let data_var = self.allocate_g1_point(&data_point);
         let blinding_var = self.allocate_scalar(commitment.blinding());
 
         let comm_constraint = Constraint {
@@ -163,7 +169,7 @@ impl Circuit {
         aggregate_sig: &AggregateSignature,
         commitment: &StateMatrixCommitment,
     ) -> Result<()> {
-        let sig_var = self.allocate_point(&aggregate_sig.aggregate);
+        let sig_var = self.allocate_g1_point(&aggregate_sig.aggregate);
 
         let mut pk_vars = Vec::new();
         for pubkey in &aggregate_sig.public_keys {
@@ -172,7 +178,7 @@ impl Circuit {
                 .serialize_compressed(&mut pk_bytes)
                 .map_err(|e| Error::circuit_error("Serialization failed", e.to_string()))?;
             let pk_point = self.groups.hash_to_g1(&pk_bytes)?;
-            pk_vars.push(self.allocate_point(&pk_point));
+            pk_vars.push(self.allocate_g1_point(&pk_point));
         }
 
         self.enforce_aggregate_equation(sig_var, &pk_vars, commitment)?;
@@ -194,7 +200,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn enforce_point_on_curve(&mut self, point: &G1, var: Variable) {
+    fn enforce_g1_point_on_curve(&mut self, point: &G1, var: Variable) {
         let (x, y) = match point.xy() {
             Some((x, y)) => (x, y),
             None => panic!("Point must not be at infinity"),
@@ -209,6 +215,32 @@ impl Circuit {
             output: vec![(x_scalar, var)],
         };
         self.constraints.push(curve_constraint);
+    }
+
+    fn enforce_g2_point_on_curve(&mut self, point: &G2, var: Variable) {
+        let (x, y) = match point.xy() {
+            Some((x, y)) => (x, y),
+            None => panic!("G2 point must not be at infinity"),
+        };
+
+        let x_c0 = fq_to_fr(x.c0);
+        let x_c1 = fq_to_fr(x.c1);
+        let y_c0 = fq_to_fr(y.c0);
+        let y_c1 = fq_to_fr(y.c1);
+
+        let curve_constraint_real = Constraint {
+            left: vec![(x_c0, var)],
+            right: vec![(y_c0, var)],
+            output: vec![(Scalar::zero(), self.allocate_variable())],
+        };
+        let curve_constraint_imag = Constraint {
+            left: vec![(x_c1, var)],
+            right: vec![(y_c1, var)],
+            output: vec![(Scalar::zero(), self.allocate_variable())],
+        };
+
+        self.constraints.push(curve_constraint_real);
+        self.constraints.push(curve_constraint_imag);
     }
 
     fn enforce_scalar_range(&mut self, value: &Scalar, var: Variable) {
@@ -240,7 +272,7 @@ impl Circuit {
             &serde_json::to_vec(commitment.data())
                 .map_err(|e| Error::circuit_error("Serialization failed", e.to_string()))?,
         )?;
-        let message_var = self.allocate_point(&message_point);
+        let message_var = self.allocate_g1_point(&message_point);
 
         let g2_var = self.allocate_variable();
         let agg_pk_var = self.allocate_variable();
@@ -295,13 +327,31 @@ impl Circuit {
         }
 
         let revocation_point = commitment.get_revocation_data();
-        let revocation_var = self.allocate_point(&revocation_point);
+        let revocation_var = self.allocate_g1_point(&revocation_point);
 
-        let expected_var = self.allocate_point(commitment.value());
+        let expected_var = self.allocate_g1_point(commitment.value());
 
         self.enforce_equal(revocation_var, expected_var);
 
         Ok(())
+    }
+
+    pub fn enforce_policy_transition(&mut self, old_policy: Variable, new_policy: Variable) {
+        let intermediate_var = self.allocate_variable();
+        self.constraints.push(Constraint {
+            left: vec![(Scalar::one(), old_policy)],
+            right: vec![(Scalar::one(), intermediate_var)],
+            output: vec![(Scalar::one(), new_policy)],
+        });
+    }
+
+    pub fn enforce_key_succession(&mut self, old_key: Variable, new_key: Variable) {
+        let intermediate_var = self.allocate_variable();
+        self.constraints.push(Constraint {
+            left: vec![(Scalar::one(), old_key)],
+            right: vec![(Scalar::one(), intermediate_var)],
+            output: vec![(Scalar::one(), new_key)],
+        });
     }
 }
 

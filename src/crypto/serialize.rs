@@ -3,8 +3,9 @@ use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Copy)]
+#[derive(Clone, Copy)]
 pub struct SerializableG1(G1);
+#[derive(Clone, Copy)]
 pub struct SerializableG2(G2);
 pub struct SerializableScalar(Scalar);
 
@@ -46,12 +47,6 @@ macro_rules! impl_point_serialization {
                 let point = <$point_type>::deserialize_compressed(&bytes[..])
                     .map_err(serde::de::Error::custom)?;
                 Ok(Self(point))
-            }
-        }
-
-        impl Clone for $name {
-            fn clone(&self) -> Self {
-                Self(self.0)
             }
         }
 

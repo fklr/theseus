@@ -305,7 +305,8 @@ mod tests {
         let groups = Arc::new(CurveGroups::new());
         let tree = SparseMerkleTree::new(Arc::clone(&groups));
         let mut pedersen = PedersenCommitment::new(*groups);
-        let mut transcript = ProofTranscript::new(DomainSeparationTags::COMMITMENT, groups);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::clone(&groups));
         let rng = RandomGenerator::new();
 
         let entry = StateMatrixEntry::new(
@@ -324,13 +325,9 @@ mod tests {
             .unwrap();
 
         let key = [5u8; 32];
-        let proof = tree
-            .insert_state_commitment(key, commitment.clone())
-            .unwrap();
+        let proof = tree.insert(key, *commitment.value()).unwrap();
 
-        assert!(tree
-            .verify_state_commitment(&key, &commitment, &proof)
-            .unwrap());
+        assert!(tree.verify_proof(&key, commitment.value(), &proof).unwrap());
         assert!(pedersen
             .verify_state_commitment(&commitment, &mut transcript)
             .unwrap());

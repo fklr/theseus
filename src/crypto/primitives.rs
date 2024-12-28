@@ -142,6 +142,17 @@ impl ProofTranscript {
         }
         challenges
     }
+
+    pub fn register_state(&mut self, label: &[u8], state: &[u8]) {
+        self.append_message(b"state-reg", label);
+        self.append_message(b"state-val", state);
+    }
+
+    pub fn get_challenge_state(&self) -> Vec<u8> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.state);
+        hasher.finalize().as_bytes().to_vec()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,20 +261,50 @@ impl CurveGroups {
     }
 }
 
+pub struct ChallengeGenerator {
+    transcript: ProofTranscript,
+    counter: u64,
+}
+
+impl ChallengeGenerator {
+    pub fn new(transcript: ProofTranscript) -> Self {
+        Self {
+            transcript,
+            counter: 0,
+        }
+    }
+
+    pub fn next_challenge(&mut self) -> Scalar {
+        self.counter += 1;
+        self.transcript
+            .append_message(b"counter", &self.counter.to_le_bytes());
+        self.transcript.challenge_scalar(b"challenge")
+    }
+}
+
 pub struct DomainSeparationTags;
 
 impl DomainSeparationTags {
-    pub const SIGNATURE: &'static [u8] = b"theseus-signature-v1";
-    pub const COMMITMENT: &'static [u8] = b"theseus-commitment-v1";
-    pub const REVOCATION: &'static [u8] = b"theseus-revocation-v1";
+    // Core proof domains
     pub const ACCESS_PROOF: &'static [u8] = b"theseus-access-proof-v1";
     pub const SUCCESSION_PROOF: &'static [u8] = b"theseus-succession-proof-v1";
-    pub const MERKLE_NODE: &'static [u8] = b"theseus-merkle-node-v1";
+    pub const REVOCATION_PROOF: &'static [u8] = b"theseus-revocation-proof-v1";
 
-    pub const ZK_STATE_PROOF: &'static [u8] = b"theseus-zk-state-v1";
-    pub const ZK_POLICY_PROOF: &'static [u8] = b"theseus-zk-policy-v1";
-    pub const ZK_ATTRIBUTE_PROOF: &'static [u8] = b"theseus-zk-attribute-v1";
-    pub const ZK_SUCCESSION_PROOF: &'static [u8] = b"theseus-zk-succession-v1";
+    // State management
+    pub const STATE_TRANSITION: &'static [u8] = b"theseus-state-transition-v1";
+    pub const PUBLIC_INPUT: &'static [u8] = b"theseus-public-input-v1";
+    pub const HISTORICAL: &'static [u8] = b"theseus-historical-v1";
+
+    // Cryptographic primitives
+    pub const ACCUMULATOR: &'static [u8] = b"theseus-accumulator-v1";
+    pub const COMMITMENT: &'static [u8] = b"theseus-commitment-v1";
+    pub const MERKLE_NODE: &'static [u8] = b"theseus-merkle-node-v1";
+    pub const REVOCATION: &'static [u8] = b"theseus-revocation-v1";
+    pub const SIGNATURE: &'static [u8] = b"theseus-signature-v1";
+
+    // Proof composition
+    pub const CROSS_TERM: &'static [u8] = b"theseus-cross-term-v1";
+    pub const FINAL_STATE: &'static [u8] = b"theseus-final-state-v1";
 }
 
 pub struct RandomGenerator;
@@ -466,7 +507,7 @@ mod tests {
         let rng = RandomGenerator::new();
 
         // Test ZK proof transcript generation
-        transcript.start_zk_proof(DomainSeparationTags::ZK_STATE_PROOF);
+        transcript.start_zk_proof(DomainSeparationTags::SUCCESSION_PROOF);
 
         let value = b"test value";
         let blinding = rng.random_scalar();
@@ -476,7 +517,7 @@ mod tests {
 
         // Verify domain separation
         let mut transcript2 = ProofTranscript::new(b"test", Arc::clone(&groups));
-        transcript2.start_zk_proof(DomainSeparationTags::ZK_POLICY_PROOF);
+        transcript2.start_zk_proof(DomainSeparationTags::ACCESS_PROOF);
 
         let commitment2 = transcript2.commit_blind(value, &blinding).unwrap();
         assert_ne!(
@@ -544,8 +585,8 @@ mod tests {
         let mut t2 = ProofTranscript::new(b"test", Arc::clone(&groups));
 
         // Start different types of ZK proofs
-        t1.start_zk_proof(DomainSeparationTags::ZK_STATE_PROOF);
-        t2.start_zk_proof(DomainSeparationTags::ZK_ATTRIBUTE_PROOF);
+        t1.start_zk_proof(DomainSeparationTags::STATE_TRANSITION);
+        t2.start_zk_proof(DomainSeparationTags::ACCESS_PROOF);
 
         // Verify challenges are independent
         let c1 = t1.challenge_scalar(b"test");

@@ -217,14 +217,21 @@ impl AccumulatorSystem {
             return Ok(false);
         }
 
-        transcript.append_message(DomainSeparationTags::STATE_TRANSITION, &proof.transition_metadata);
+        transcript.append_message(
+            DomainSeparationTags::STATE_TRANSITION,
+            &proof.transition_metadata,
+        );
         transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &old_commitment);
-        transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &new_state.get_commitment());
+        transcript.append_point_g1(
+            DomainSeparationTags::COMMITMENT,
+            &new_state.get_commitment(),
+        );
 
         let challenge = transcript.challenge_scalar(DomainSeparationTags::ACCUMULATOR);
 
-        let computed = (old_commitment.into_group() * challenge +
-                       new_state.get_commitment().into_group()).into_affine();
+        let computed = (old_commitment.into_group()
+            + new_state.get_commitment().into_group() * challenge)
+            .into_affine();
 
         Ok(computed == proof.new_accumulator)
     }
@@ -234,24 +241,25 @@ impl AccumulatorSystem {
             return Ok(true);
         }
 
-        let mut transcript = self.transcript.clone();
         let mut current = *commitments[0].value.inner();
 
         for window in commitments.windows(2) {
-            transcript.append_message(b"epoch", &window[0].epoch.to_le_bytes());
-            transcript.append_message(b"metadata", &window[0].metadata);
+            let mut transcript = self.transcript.clone();
+            let next = *window[1].value.inner();
+
+            transcript.append_message(DomainSeparationTags::STATE_TRANSITION, &window[0].epoch.to_le_bytes());
+            transcript.append_message(DomainSeparationTags::HISTORICAL, &window[0].metadata);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &current);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &next);
 
             let challenge = transcript.challenge_scalar(DomainSeparationTags::ACCUMULATOR);
+            let expected = (current + next.into_group() * challenge).into_affine();
 
-            let next_value = *window[1].value.inner();
-            let expected =
-                (current.into_group() * challenge + window[1].value.into_group()).into_affine();
-
-            if expected != next_value {
+            if next != expected {
                 return Ok(false);
             }
 
-            current = next_value;
+            current = expected;
         }
 
         Ok(true)
@@ -345,18 +353,41 @@ mod tests {
     fn test_accumulator_chain() {
         let accum = setup_test_accumulator();
         let rng = RandomGenerator::new();
+        let mut commitments = Vec::new();
 
-        let commitments: Vec<_> = (0..3)
-            .map(|i| {
-                let value = rng.random_scalar();
-                let point = (accum.groups.g1_generator * value).into_affine();
-                HistoricalAccumulator {
-                    value: point.into(),
-                    epoch: i as u64,
-                    metadata: vec![i as u8],
-                }
-            })
-            .collect();
+        let initial_value = rng.random_scalar();
+        let initial_point = (accum.groups.g1_generator * initial_value).into_affine();
+        commitments.push(HistoricalAccumulator {
+            value: initial_point.into(),
+            epoch: 0,
+            metadata: vec![0],
+        });
+
+        let mut current = initial_point;
+        for i in 1..3 {
+            let mut transcript = accum.transcript.clone();
+            let value = rng.random_scalar();
+            let next = (accum.groups.g1_generator * value).into_affine();
+
+            transcript.append_message(
+                DomainSeparationTags::STATE_TRANSITION,
+                &((i - 1) as u64).to_le_bytes(),
+            );
+            transcript.append_message(DomainSeparationTags::HISTORICAL, &[(i - 1) as u8]);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &current);
+            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &next);
+
+            let challenge = transcript.challenge_scalar(DomainSeparationTags::ACCUMULATOR);
+            let accumulated = (current + next.into_group() * challenge).into_affine();
+
+            commitments.push(HistoricalAccumulator {
+                value: accumulated.into(),
+                epoch: i as u64,
+                metadata: vec![i as u8],
+            });
+
+            current = accumulated;
+        }
 
         assert!(accum.verify_accumulator_chain(&commitments).unwrap());
     }

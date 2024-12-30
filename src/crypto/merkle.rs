@@ -2,11 +2,11 @@ use crate::{
     crypto::{
         primitives::{CurveGroups, DomainSeparationTags, G1},
         serialize::{IntoSerializable, SerializableG1},
-        ProofTranscript, StateMatrixCommitment,
+        PedersenCommitment, ProofTranscript, StateMatrixCommitment,
     },
     errors::{Error, Result},
 };
-use ark_ec::CurveGroup;
+use ark_ec::AffineRepr;
 use ark_serialize::CanonicalSerialize;
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -45,10 +45,10 @@ impl SparseMerkleTree {
     }
 
     pub fn insert(&self, key: [u8; 32], value: G1) -> Result<MerkleProof> {
-        if !value.is_on_curve() {
+        if value.is_zero() || !value.is_on_curve() {
             return Err(Error::merkle_error(
                 "Invalid input point",
-                "Point must be on the curve",
+                "Point must be non-zero and on the curve",
             ));
         }
 
@@ -132,8 +132,13 @@ impl SparseMerkleTree {
         &self,
         key: [u8; 32],
         commitment: StateMatrixCommitment,
+        transcript: &ProofTranscript,
     ) -> Result<MerkleProof> {
-        self.insert(key, *commitment.value())
+        let mut proof = self.insert(key, *commitment.value())?;
+
+        proof.transcript_state = transcript.clone_state();
+
+        Ok(proof)
     }
 
     pub fn verify_state_commitment(
@@ -142,15 +147,15 @@ impl SparseMerkleTree {
         commitment: &StateMatrixCommitment,
         proof: &MerkleProof,
     ) -> Result<bool> {
-        let serialized = serde_json::to_vec(commitment.data())?;
-        let mut current = self.groups.hash_to_g1(&serialized)?;
-        current = (current + self.groups.g1_generator * commitment.blinding()).into_affine();
+        let mut pedersen = PedersenCommitment::new(*self.groups);
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::clone(&self.groups));
 
-        if current != *commitment.value() {
+        if !pedersen.verify_state_commitment(commitment, &mut transcript)? {
             return Ok(false);
         }
 
-        self.verify_proof(key, &current, proof)
+        self.verify_proof(key, commitment.value(), proof)
     }
 
     pub fn batch_verify_state(
@@ -212,8 +217,6 @@ impl SparseMerkleTree {
 
 #[cfg(test)]
 mod tests {
-    use ark_ec::AffineRepr;
-
     use super::*;
     use crate::crypto::{
         commitment::StateMatrixEntry, primitives::RandomGenerator, PedersenCommitment,
@@ -389,6 +392,8 @@ mod tests {
     fn test_state_commitment_verification() {
         let groups = Arc::new(CurveGroups::new());
         let tree = SparseMerkleTree::new(Arc::clone(&groups));
+        let mut transcript =
+            ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::clone(&groups));
         let rng = RandomGenerator::new();
 
         let entry = StateMatrixEntry::new(
@@ -403,16 +408,17 @@ mod tests {
 
         let blinding = rng.random_scalar();
         let mut pedersen = PedersenCommitment::new(*groups);
-        let mut transcript =
-            ProofTranscript::new(DomainSeparationTags::COMMITMENT, Arc::clone(&groups));
 
+        // Create commitment using transcript
         let commitment = pedersen
             .commit_state_entry(entry, &blinding, &mut transcript)
             .expect("Valid commitment");
 
         let key = rng.random_bytes(32).try_into().expect("Valid test bytes");
+
+        // Insert with transcript state
         let proof = tree
-            .insert_state_commitment(key, commitment.clone())
+            .insert_state_commitment(key, commitment.clone(), &transcript)
             .expect("Valid insertion");
 
         assert!(tree
@@ -448,7 +454,7 @@ mod tests {
 
         let key = rng.random_bytes(32).try_into().expect("Valid test bytes");
         let proof = tree
-            .insert_state_commitment(key, commitment.clone())
+            .insert_state_commitment(key, commitment.clone(), &transcript)
             .expect("Valid insertion");
 
         // Create different entry with same key but different access level

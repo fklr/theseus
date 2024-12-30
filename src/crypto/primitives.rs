@@ -301,6 +301,7 @@ impl DomainSeparationTags {
     pub const MERKLE_NODE: &'static [u8] = b"theseus-merkle-node-v1";
     pub const REVOCATION: &'static [u8] = b"theseus-revocation-v1";
     pub const SIGNATURE: &'static [u8] = b"theseus-signature-v1";
+    pub const WITNESS: &'static [u8] = b"theseus-witness-v1";
 
     // Proof composition
     pub const CROSS_TERM: &'static [u8] = b"theseus-cross-term-v1";

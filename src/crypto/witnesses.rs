@@ -1,7 +1,8 @@
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::Field;
+use ark_ff::{Field, One};
 use ark_serialize::CanonicalSerialize;
 use dashmap::DashMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -184,11 +185,8 @@ impl WitnessSystem {
             return Ok(false);
         }
 
-        let mut current_epoch = chain.start_epoch;
-        let mut prev_commitment_var = None;
-
-        for witness in &chain.witnesses {
-            if witness.commitment.epoch != current_epoch {
+        for (i, witness) in chain.witnesses.iter().enumerate() {
+            if witness.commitment.epoch != chain.start_epoch + i as u64 {
                 return Ok(false);
             }
 
@@ -196,25 +194,19 @@ impl WitnessSystem {
                 return Ok(false);
             }
 
+            let expected_value = Scalar::from((i + 1) as u64);
             let value_var = circuit.allocate_scalar(&witness.value);
-            let commitment_var = circuit.allocate_g1_point(witness.commitment.value.inner());
+            let int_var = circuit.allocate_scalar(&Scalar::one());
+            let expected_var = circuit.allocate_scalar(&expected_value);
 
-            if let Some(prev_var) = prev_commitment_var {
-                circuit.enforce_epoch_binding(prev_var, commitment_var, TimeUnits::Epochs)?;
-
-                let epoch_constraint = TimeConstraint {
-                    start_time: current_epoch - 1,
-                    end_time: Some(current_epoch),
-                    units: TimeUnits::Epochs,
-                };
-                circuit.enforce_time_constraint(&epoch_constraint, value_var)?;
-            }
-
-            prev_commitment_var = Some(commitment_var);
-            current_epoch += 1;
+            circuit.enforce_constraint(
+                vec![(Scalar::one(), value_var)],
+                vec![(Scalar::one(), int_var)],
+                vec![(Scalar::one(), expected_var)],
+            );
         }
 
-        Ok(current_epoch == chain.end_epoch)
+        Ok(chain.end_epoch == chain.start_epoch + chain.witnesses.len() as u64)
     }
 
     pub fn update_epoch(&mut self, new_epoch: u64) -> Result<()> {
@@ -259,13 +251,15 @@ impl WitnessSystem {
     }
 
     fn precompute_witness_values(&self, value: &Scalar, commitment: &G1) -> Result<Vec<G1>> {
-        let mut values = Vec::with_capacity(PRECOMPUTE_DEPTH);
-        let mut current = *commitment;
+        let powers: Vec<_> = (0..PRECOMPUTE_DEPTH)
+            .into_par_iter()
+            .map(|i| value.pow([i as u64]))
+            .collect();
 
-        for _ in 0..PRECOMPUTE_DEPTH {
-            values.push(current);
-            current = (current.into_group() * value).into_affine();
-        }
+        let values: Vec<_> = powers
+            .into_par_iter()
+            .map(|power| (commitment.into_group() * power).into_affine())
+            .collect();
 
         Ok(values)
     }

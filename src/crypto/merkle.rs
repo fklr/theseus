@@ -19,7 +19,7 @@ pub struct MerkleProof {
     pub siblings: Vec<SerializableG1>,
     pub root: SerializableG1,
     pub value: SerializableG1,
-    pub transcript_state: Vec<u8>,
+    pub transcript_binding: Vec<u8>,
 }
 
 pub struct SparseMerkleTree {
@@ -84,7 +84,7 @@ impl SparseMerkleTree {
             siblings: siblings.into_serializable(),
             root: current.into(),
             value: value.into(),
-            transcript_state: Vec::new(),
+            transcript_binding: Vec::new(),
         };
 
         self.proof_cache.insert(key, proof.clone());
@@ -132,12 +132,17 @@ impl SparseMerkleTree {
         &self,
         key: [u8; 32],
         commitment: StateMatrixCommitment,
-        transcript: &ProofTranscript,
+        transcript: &mut ProofTranscript,
     ) -> Result<MerkleProof> {
         let mut proof = self.insert(key, *commitment.value())?;
 
-        proof.transcript_state = transcript.clone_state();
+        let binding_scalar = transcript.challenge_scalar(b"merkle-binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
 
+        proof.transcript_binding = binding;
         Ok(proof)
     }
 
@@ -207,9 +212,15 @@ impl SparseMerkleTree {
         transcript.append_point_g1(DomainSeparationTags::MERKLE_NODE, right);
         transcript.append_message(b"depth", &depth.to_le_bytes());
 
+        let binding_scalar = transcript.challenge_scalar(b"merkle-node-binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
+
         left.serialize_compressed(&mut buf)?;
         right.serialize_compressed(&mut buf)?;
-        buf.extend_from_slice(&transcript.clone_state());
+        buf.extend_from_slice(&binding);
 
         self.groups.hash_to_g1(&buf)
     }
@@ -418,7 +429,7 @@ mod tests {
 
         // Insert with transcript state
         let proof = tree
-            .insert_state_commitment(key, commitment.clone(), &transcript)
+            .insert_state_commitment(key, commitment.clone(), &mut transcript)
             .expect("Valid insertion");
 
         assert!(tree
@@ -454,7 +465,7 @@ mod tests {
 
         let key = rng.random_bytes(32).try_into().expect("Valid test bytes");
         let proof = tree
-            .insert_state_commitment(key, commitment.clone(), &transcript)
+            .insert_state_commitment(key, commitment.clone(), &mut transcript)
             .expect("Valid insertion");
 
         // Create different entry with same key but different access level

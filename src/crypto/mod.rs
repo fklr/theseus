@@ -5,6 +5,7 @@ pub mod primitives;
 pub mod proofs;
 pub mod serialize;
 pub mod signatures;
+pub mod witnesses;
 
 pub use circuits::{Circuit, Constraint, Variable};
 pub use circuits::{Circuit, Constraint, TimeConstraint, Variable};

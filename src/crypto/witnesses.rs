@@ -1,5 +1,5 @@
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{Field, One};
+use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -32,7 +32,7 @@ pub struct HistoricalWitness {
 #[derive(Clone, Debug)]
 pub struct ChainWitness {
     pub witnesses: Vec<HistoricalWitness>,
-    pub metadata: Vec<u8>,
+    pub transcript_binding: Vec<u8>,
     pub start_epoch: u64,
     pub end_epoch: u64,
 }
@@ -124,9 +124,19 @@ impl WitnessSystem {
             current_epoch += step;
         }
 
+        let mut transcript = self.transcript.clone();
+        transcript.append_message(b"chain-start", &start_epoch.to_le_bytes());
+        transcript.append_message(b"chain-end", &current_epoch.to_le_bytes());
+
+        let binding_scalar = transcript.challenge_scalar(b"chain-binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
+
         let chain = ChainWitness {
             witnesses,
-            metadata: self.transcript.clone_state(),
+            transcript_binding: binding,
             start_epoch,
             end_epoch: current_epoch,
         };
@@ -196,14 +206,9 @@ impl WitnessSystem {
 
             let expected_value = Scalar::from((i + 1) as u64);
             let value_var = circuit.allocate_scalar(&witness.value);
-            let int_var = circuit.allocate_scalar(&Scalar::one());
             let expected_var = circuit.allocate_scalar(&expected_value);
 
-            circuit.enforce_constraint(
-                vec![(Scalar::one(), value_var)],
-                vec![(Scalar::one(), int_var)],
-                vec![(Scalar::one(), expected_var)],
-            );
+            circuit.enforce_equal(value_var, expected_var);
         }
 
         Ok(chain.end_epoch == chain.start_epoch + chain.witnesses.len() as u64)
@@ -275,7 +280,7 @@ impl WitnessSystem {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&chain.start_epoch.to_le_bytes());
         hasher.update(&chain.end_epoch.to_le_bytes());
-        hasher.update(&chain.metadata);
+        hasher.update(&chain.transcript_binding);
         *hasher.finalize().as_bytes()
     }
 }
@@ -347,10 +352,13 @@ mod tests {
         // Create sequential values for better testing
         let values: Vec<_> = (0..3).map(|i| Scalar::from((i + 1) as u64)).collect();
 
-        let mut circuit = Circuit::new(Arc::clone(&system.groups));
-
         // Create witness chain with proper epoch sequencing
         let chain = system.create_witness_chain(&values, 0, 1).unwrap();
+
+        // Update system epoch so that all witness epochs (0..=2) are valid
+        system.update_epoch(chain.end_epoch).unwrap();
+
+        let mut circuit = Circuit::new(Arc::clone(&system.groups));
 
         // Verify chain properties
         assert_eq!(chain.witnesses.len(), 3);

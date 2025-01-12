@@ -7,6 +7,7 @@ pub mod serialize;
 pub mod signatures;
 
 pub use circuits::{Circuit, Constraint, Variable};
+pub use circuits::{Circuit, Constraint, TimeConstraint, Variable};
 pub use commitment::{PedersenCommitment, StateMatrixCommitment};
 pub use merkle::SparseMerkleTree;
 pub use primitives::{CurveGroups, ProofTranscript, Scalar, G1, G2, GT};

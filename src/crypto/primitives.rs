@@ -1,8 +1,9 @@
 use ark_bls12_377::{Bls12_377, Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup};
-use ark_ff::{PrimeField, UniformRand};
+use ark_ff::{BigInteger, PrimeField, UniformRand};
 use ark_serialize::CanonicalSerialize;
 use blake3::Hasher;
+use merlin::Transcript as MerlinTranscript;
 use rand::{thread_rng, RngCore};
 use std::sync::Arc;
 
@@ -15,64 +16,65 @@ pub type GT = <Bls12_377 as Pairing>::TargetField;
 
 #[derive(Clone)]
 pub struct ProofTranscript {
-    state: Vec<u8>,
+    merlin: MerlinTranscript,
     groups: Arc<CurveGroups>,
 }
 
 impl ProofTranscript {
     pub fn new(domain: &[u8], groups: Arc<CurveGroups>) -> Self {
-        let mut state = Vec::new();
-        state.extend_from_slice(domain);
-        Self { state, groups }
+        let mut merlin = MerlinTranscript::new(b"theseus-v1");
+        let domain_bytes = domain.to_vec();
+        merlin.append_message(b"dom-sep", &domain_bytes);
+        Self { merlin, groups }
     }
 
-    pub fn append_message(&mut self, label: &[u8], message: &[u8]) {
-        self.state.extend_from_slice(label);
-        self.state
-            .extend_from_slice(&(message.len() as u64).to_le_bytes());
-        self.state.extend_from_slice(message);
+    pub fn append_message(&mut self, label: &'static [u8], message: &[u8]) {
+        self.merlin.append_message(label, message);
     }
 
-    pub fn append_scalar(&mut self, label: &[u8], scalar: &Scalar) {
+    pub fn append_scalar(&mut self, label: &'static [u8], scalar: &Scalar) {
         let mut bytes = Vec::new();
-        scalar.serialize_compressed(&mut bytes).unwrap();
-        self.append_message(label, &bytes);
+        scalar
+            .serialize_compressed(&mut bytes)
+            .expect("Serialization cannot fail");
+        self.merlin.append_message(label, &bytes);
     }
 
-    pub fn append_point_g1(&mut self, label: &[u8], point: &G1) {
+    pub fn append_point_g1(&mut self, label: &'static [u8], point: &G1) {
         let mut bytes = Vec::new();
-        point.serialize_compressed(&mut bytes).unwrap();
-        self.append_message(label, &bytes);
+        point
+            .serialize_compressed(&mut bytes)
+            .expect("Serialization cannot fail");
+        self.merlin.append_message(label, &bytes);
     }
 
-    pub fn append_point_g2(&mut self, label: &[u8], point: &G2) {
+    pub fn append_point_g2(&mut self, label: &'static [u8], point: &G2) {
         let mut bytes = Vec::new();
-        point.serialize_compressed(&mut bytes).unwrap();
-        self.append_message(label, &bytes);
+        point
+            .serialize_compressed(&mut bytes)
+            .expect("Serialization cannot fail");
+        self.merlin.append_message(label, &bytes);
     }
 
-    pub fn challenge_scalar(&mut self, label: &[u8]) -> Scalar {
-        self.state.extend_from_slice(label);
-        let point = self
-            .groups
-            .hash_to_g1(&self.state)
-            .expect("Hash should not fail");
-        let mut bytes = Vec::new();
-        point.serialize_compressed(&mut bytes).unwrap();
+    pub fn challenge_scalar(&mut self, label: &'static [u8]) -> Scalar {
+        let mut bytes = [0u8; 64];
+        self.merlin.challenge_bytes(label, &mut bytes);
         Scalar::from_le_bytes_mod_order(&bytes)
     }
 
-    pub fn challenge_point_g1(&mut self, label: &[u8]) -> Result<G1> {
-        self.state.extend_from_slice(label);
-        self.groups.hash_to_g1(&self.state)
+    pub fn challenge_point_g1(&mut self, label: &'static [u8]) -> Result<G1> {
+        let mut bytes = [0u8; 64];
+        self.merlin.challenge_bytes(label, &mut bytes);
+        self.groups.hash_to_g1(&bytes)
     }
 
-    pub fn challenge_point_g2(&mut self, label: &[u8]) -> Result<G2> {
-        self.state.extend_from_slice(label);
-        self.groups.hash_to_g2(&self.state)
+    pub fn challenge_point_g2(&mut self, label: &'static [u8]) -> Result<G2> {
+        let mut bytes = [0u8; 64];
+        self.merlin.challenge_bytes(label, &mut bytes);
+        self.groups.hash_to_g2(&bytes)
     }
 
-    pub fn append_scalars<'a, I>(&mut self, label: &[u8], scalars: I)
+    pub fn append_scalars<'a, I>(&mut self, label: &'static [u8], scalars: I)
     where
         I: IntoIterator<Item = &'a Scalar>,
     {
@@ -81,7 +83,7 @@ impl ProofTranscript {
         }
     }
 
-    pub fn append_points_g1<'a, I>(&mut self, label: &[u8], points: I)
+    pub fn append_points_g1<'a, I>(&mut self, label: &'static [u8], points: I)
     where
         I: IntoIterator<Item = &'a G1>,
     {
@@ -90,7 +92,7 @@ impl ProofTranscript {
         }
     }
 
-    pub fn append_points_g2<'a, I>(&mut self, label: &[u8], points: I)
+    pub fn append_points_g2<'a, I>(&mut self, label: &'static [u8], points: I)
     where
         I: IntoIterator<Item = &'a G2>,
     {
@@ -99,25 +101,22 @@ impl ProofTranscript {
         }
     }
 
-    pub fn clone_state(&self) -> Vec<u8> {
-        self.state.clone()
-    }
-
-    pub fn reset_with_state(&mut self, state: Vec<u8>) {
-        self.state = state;
-    }
-
-    pub fn start_zk_proof(&mut self, proof_type: &[u8]) {
-        self.state.clear();
-        self.state.extend_from_slice(proof_type);
+    pub fn init_proof(&mut self, proof_type: impl AsRef<[u8]>) {
+        self.merlin = MerlinTranscript::new(b"theseus-v1");
+        self.merlin.append_message(b"domain", b"proof");
+        self.merlin.append_message(b"type", proof_type.as_ref());
     }
 
     pub fn commit_blind(&mut self, value: &[u8], blinding: &Scalar) -> Result<G1> {
-        let mut data = self.state.clone();
-        data.extend_from_slice(value);
+        let domain_challenge = self.challenge_scalar(b"domain");
 
-        let value_point = self.groups.hash_to_g1(&data)?;
-        let blinded = (value_point + self.groups.g1_generator * blinding).into_affine();
+        let mut message = Vec::new();
+        message.extend_from_slice(&domain_challenge.into_bigint().to_bytes_le());
+        message.extend_from_slice(value);
+        message.extend_from_slice(&blinding.into_bigint().to_bytes_le());
+
+        let point = self.groups.hash_to_g1(&message)?;
+        let blinded = (point + self.groups.g1_generator * blinding).into_affine();
         self.append_point_g1(b"commitment", &blinded);
         Ok(blinded)
     }
@@ -125,7 +124,14 @@ impl ProofTranscript {
     pub fn generate_challenge_polynomial(&mut self, degree: usize) -> Vec<Scalar> {
         let mut coefficients = Vec::with_capacity(degree + 1);
         for i in 0..=degree {
-            let challenge = self.challenge_scalar(format!("poly-{}", i).as_bytes());
+            let label = match i {
+                0 => b"poly-0",
+                1 => b"poly-1",
+                2 => b"poly-2",
+                3 => b"poly-3",
+                _ => b"poly-n",
+            };
+            let challenge = self.challenge_scalar(label);
             coefficients.push(challenge);
         }
         coefficients
@@ -136,22 +142,11 @@ impl ProofTranscript {
         let initial = self.challenge_scalar(b"batch-init");
         challenges.push(initial);
 
-        for i in 1..count {
-            self.append_scalar(b"prev", &challenges[i - 1]);
-            challenges.push(self.challenge_scalar(format!("batch-{}", i).as_bytes()));
+        for _ in 1..count {
+            self.append_scalar(b"prev", challenges.last().unwrap());
+            challenges.push(self.challenge_scalar(b"batch-next"));
         }
         challenges
-    }
-
-    pub fn register_state(&mut self, label: &[u8], state: &[u8]) {
-        self.append_message(b"state-reg", label);
-        self.append_message(b"state-val", state);
-    }
-
-    pub fn get_challenge_state(&self) -> Vec<u8> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.state);
-        hasher.finalize().as_bytes().to_vec()
     }
 }
 
@@ -453,22 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transcript_state_management() {
-        let groups = Arc::new(CurveGroups::new());
-        let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
-
-        t1.append_message(b"m", b"test");
-        let state = t1.clone_state();
-        let c1 = t1.challenge_scalar(b"c");
-
-        let mut t2 = ProofTranscript::new(b"different", Arc::clone(&groups));
-        t2.reset_with_state(state);
-        let c2 = t2.challenge_scalar(b"c");
-
-        assert_eq!(c1, c2);
-    }
-
-    #[test]
     fn test_batch_operations() {
         let groups = Arc::new(CurveGroups::new());
         let mut t1 = ProofTranscript::new(b"test", Arc::clone(&groups));
@@ -508,7 +487,7 @@ mod tests {
         let rng = RandomGenerator::new();
 
         // Test ZK proof transcript generation
-        transcript.start_zk_proof(DomainSeparationTags::SUCCESSION_PROOF);
+        transcript.init_proof(DomainSeparationTags::SUCCESSION_PROOF);
 
         let value = b"test value";
         let blinding = rng.random_scalar();
@@ -518,7 +497,7 @@ mod tests {
 
         // Verify domain separation
         let mut transcript2 = ProofTranscript::new(b"test", Arc::clone(&groups));
-        transcript2.start_zk_proof(DomainSeparationTags::ACCESS_PROOF);
+        transcript2.init_proof(DomainSeparationTags::ACCESS_PROOF);
 
         let commitment2 = transcript2.commit_blind(value, &blinding).unwrap();
         assert_ne!(
@@ -586,8 +565,8 @@ mod tests {
         let mut t2 = ProofTranscript::new(b"test", Arc::clone(&groups));
 
         // Start different types of ZK proofs
-        t1.start_zk_proof(DomainSeparationTags::STATE_TRANSITION);
-        t2.start_zk_proof(DomainSeparationTags::ACCESS_PROOF);
+        t1.init_proof(DomainSeparationTags::STATE_TRANSITION);
+        t2.init_proof(DomainSeparationTags::ACCESS_PROOF);
 
         // Verify challenges are independent
         let c1 = t1.challenge_scalar(b"test");

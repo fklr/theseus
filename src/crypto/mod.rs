@@ -1,3 +1,4 @@
+pub mod accumulators;
 pub mod circuits;
 pub mod commitment;
 pub mod merkle;
@@ -7,7 +8,6 @@ pub mod serialize;
 pub mod signatures;
 pub mod witnesses;
 
-pub use circuits::{Circuit, Constraint, Variable};
 pub use circuits::{Circuit, Constraint, TimeConstraint, Variable};
 pub use commitment::{PedersenCommitment, StateMatrixCommitment};
 pub use merkle::SparseMerkleTree;

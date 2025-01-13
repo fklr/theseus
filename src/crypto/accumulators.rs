@@ -1,4 +1,5 @@
 use ark_ec::{AffineRepr, CurveGroup};
+use ark_serialize::CanonicalSerialize;
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use crate::{
@@ -22,7 +23,7 @@ pub struct AccumulatorSystem {
 pub struct HistoricalAccumulator {
     pub value: SerializableG1,
     pub epoch: u64,
-    pub metadata: Vec<u8>,
+    pub transcript_binding: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,13 +65,19 @@ impl AccumulatorSystem {
         self.current_accumulator =
             (self.current_accumulator + point.into_group() * challenge).into();
 
+        let binding_scalar = transcript.challenge_scalar(b"binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
+
         Ok(HistoricalAccumulator {
             value: self.current_accumulator.into(),
             epoch: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            metadata: transcript.clone_state(),
+            transcript_binding: binding,
         })
     }
 
@@ -92,12 +99,18 @@ impl AccumulatorSystem {
             transition_witness: witness,
         };
 
+        let binding_scalar = transcript.challenge_scalar(b"binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
+
         self.epoch_boundaries.insert(epoch, boundary.clone());
 
         self.historical_accumulators.push(HistoricalAccumulator {
             value: self.current_accumulator.into(),
             epoch,
-            metadata: transition_data.to_vec(),
+            transcript_binding: binding,
         });
 
         self.current_accumulator = G1::zero();
@@ -147,7 +160,6 @@ impl AccumulatorSystem {
         let mut transcript = self.transcript.clone();
         let mut batch_accumulator = G1::zero();
 
-        // Accumulate each proof with its metadata
         for (proof, data) in proofs.iter().zip(metadata) {
             let commitment = proof.get_commitment();
             transcript.append_message(DomainSeparationTags::PUBLIC_INPUT, data);
@@ -157,8 +169,13 @@ impl AccumulatorSystem {
             batch_accumulator = (batch_accumulator + commitment.into_group() * challenge).into();
         }
 
-        // Update system accumulator
         self.current_accumulator = (self.current_accumulator + batch_accumulator).into_affine();
+
+        let binding_scalar = transcript.challenge_scalar(b"binding");
+        let mut binding = Vec::new();
+        binding_scalar
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
 
         Ok(HistoricalAccumulator {
             value: self.current_accumulator.into(),
@@ -166,7 +183,7 @@ impl AccumulatorSystem {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            metadata: transcript.clone_state(),
+            transcript_binding: binding,
         })
     }
 
@@ -217,6 +234,18 @@ impl AccumulatorSystem {
             return Ok(false);
         }
 
+        if !proof.old_accumulator.is_on_curve() || !proof.new_accumulator.is_on_curve() {
+            return Ok(false);
+        }
+
+        let e1 = self.groups.pair(&old_commitment, &self.groups.g2_generator);
+        let e2 = self
+            .groups
+            .pair(&proof.old_accumulator, &self.groups.g2_generator);
+        if e1 != e2 {
+            return Ok(false);
+        }
+
         transcript.append_message(
             DomainSeparationTags::STATE_TRANSITION,
             &proof.transition_metadata,
@@ -241,25 +270,23 @@ impl AccumulatorSystem {
             return Ok(true);
         }
 
+        let mut transcript = self.transcript.clone();
         let mut current = *commitments[0].value.inner();
+        transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &current);
+        transcript.challenge_scalar(b"binding");
 
         for window in commitments.windows(2) {
-            let mut transcript = self.transcript.clone();
             let next = *window[1].value.inner();
-
-            transcript.append_message(DomainSeparationTags::STATE_TRANSITION, &window[0].epoch.to_le_bytes());
-            transcript.append_message(DomainSeparationTags::HISTORICAL, &window[0].metadata);
             transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &current);
-            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &next);
-
             let challenge = transcript.challenge_scalar(DomainSeparationTags::ACCUMULATOR);
-            let expected = (current + next.into_group() * challenge).into_affine();
 
-            if next != expected {
+            let expected = (current + self.groups.g1_generator * challenge).into_affine();
+            if expected != next {
                 return Ok(false);
             }
 
-            current = expected;
+            transcript.challenge_scalar(b"binding");
+            current = next;
         }
 
         Ok(true)
@@ -352,38 +379,41 @@ mod tests {
     #[test]
     fn test_accumulator_chain() {
         let accum = setup_test_accumulator();
+        let mut transcript = accum.transcript.clone();
         let rng = RandomGenerator::new();
         let mut commitments = Vec::new();
 
-        let initial_value = rng.random_scalar();
-        let initial_point = (accum.groups.g1_generator * initial_value).into_affine();
+        let initial_point = (accum.groups.g1_generator * rng.random_scalar()).into_affine();
+        transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &initial_point);
+
+        let mut binding = Vec::new();
+        transcript
+            .challenge_scalar(b"binding")
+            .serialize_compressed(&mut binding)
+            .expect("Serialization cannot fail");
+
         commitments.push(HistoricalAccumulator {
             value: initial_point.into(),
             epoch: 0,
-            metadata: vec![0],
+            transcript_binding: binding,
         });
 
         let mut current = initial_point;
         for i in 1..3 {
-            let mut transcript = accum.transcript.clone();
-            let value = rng.random_scalar();
-            let next = (accum.groups.g1_generator * value).into_affine();
-
-            transcript.append_message(
-                DomainSeparationTags::STATE_TRANSITION,
-                &((i - 1) as u64).to_le_bytes(),
-            );
-            transcript.append_message(DomainSeparationTags::HISTORICAL, &[(i - 1) as u8]);
             transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &current);
-            transcript.append_point_g1(DomainSeparationTags::COMMITMENT, &next);
-
             let challenge = transcript.challenge_scalar(DomainSeparationTags::ACCUMULATOR);
-            let accumulated = (current + next.into_group() * challenge).into_affine();
+            let accumulated = (current + accum.groups.g1_generator * challenge).into_affine();
+
+            let mut binding = Vec::new();
+            transcript
+                .challenge_scalar(b"binding")
+                .serialize_compressed(&mut binding)
+                .expect("Serialization cannot fail");
 
             commitments.push(HistoricalAccumulator {
                 value: accumulated.into(),
-                epoch: i as u64,
-                metadata: vec![i as u8],
+                epoch: i,
+                transcript_binding: binding,
             });
 
             current = accumulated;
